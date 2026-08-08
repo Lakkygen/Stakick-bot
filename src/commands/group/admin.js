@@ -101,8 +101,7 @@ export async function warn(c, update, parsed) {
   } else {
     await c.env.KV.put(key, JSON.stringify(warns));
     await tg.sendMessage(c.env.BOT_TOKEN, message.chat.id,
-      `⚠️ <a href="tg://user?id=${target.id}">${target.first_name}</a> — Warning ${warns.length}/3
-<i>${reason}</i>`,
+      `⚠️ <a href="tg://user?id=${target.id}">${target.first_name}</a> — Warning ${warns.length}/3\n<i>${reason}</i>`,
       { parse_mode: 'HTML' });
   }
   return c.text('OK');
@@ -143,10 +142,8 @@ export async function listWarns(c, update, parsed) {
     return c.text('OK');
   }
 
-  const list = warns.map((w, i) => `${i + 1}. ${w.reason} (by ${w.by})`).join('
-');
+  const list = warns.map((w, i) => `${i + 1}. ${w.reason} (by ${w.by})`).join('\n');
   await tg.sendMessage(c.env.BOT_TOKEN, message.chat.id,
-    `⚠️ Warnings for <a href="tg://user?id=${target.id}">${target.first_name}</a>:
-${list}`, { parse_mode: 'HTML' });
+    `⚠️ Warnings for <a href="tg://user?id=${target.id}">${target.first_name}</a>:\n${list}`, { parse_mode: 'HTML' });
   return c.text('OK');
 }
