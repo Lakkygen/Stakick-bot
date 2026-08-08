@@ -8,8 +8,7 @@ export async function remind(c, update, parsed) {
   const match = args.match(/^(\d+)\s*(m|min|h|hour|d|day)s?\s+(.+)$/i);
   if (!match) {
     await tg.sendMessage(c.env.BOT_TOKEN, chatId,
-      '⏰ Usage: <code>/remind 30m Check the oven</code>
-Formats: 10m, 2h, 1d', { parse_mode: 'HTML' });
+      '⏰ Usage: <code>/remind 30m Check the oven</code>\nFormats: 10m, 2h, 1d', { parse_mode: 'HTML' });
     return c.text('OK');
   }
 
@@ -23,8 +22,7 @@ Formats: 10m, 2h, 1d', { parse_mode: 'HTML' });
   ).bind(chatId, userId, text, remindAt, Date.now()).run();
 
   await tg.sendMessage(c.env.BOT_TOKEN, chatId,
-    `⏰ Got it! I'll remind you in <b>${amount}${unit}</b>:
-<i>${text}</i>`, { parse_mode: 'HTML' });
+    `⏰ Got it! I'll remind you in <b>${amount}${unit}</b>:\n<i>${text}</i>`, { parse_mode: 'HTML' });
   return c.text('OK');
 }
 
@@ -36,8 +34,7 @@ export async function checkReminders(c) {
 
   for (const row of due.results || []) {
     await tg.sendMessage(c.env.BOT_TOKEN, row.chat_id,
-      `⏰ <a href="tg://user?id=${row.user_id}">Reminder</a>:
-<b>${row.text}</b>`, { parse_mode: 'HTML' });
+      `⏰ <a href="tg://user?id=${row.user_id}">Reminder</a>:\n<b>${row.text}</b>`, { parse_mode: 'HTML' });
 
     await c.env.DB.prepare('UPDATE reminders SET sent = 1 WHERE id = ?').bind(row.id).run();
   }
