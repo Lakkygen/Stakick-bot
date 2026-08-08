@@ -1,0 +1,29 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "stakick-bot",
+  "main": "src/index.js",
+  "compatibility_date": "2026-08-08",
+  "workers_dev": true,
+
+  "vars": {
+    "BOT_USERNAME": "StakickBot",
+    "OWNER_KICK_SLUG": "lakkygen"
+  },
+
+  "kv_namespaces": [
+    {
+      "binding": "KV"
+    }
+  ],
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "stakick-db"
+    }
+  ],
+
+  "triggers": {
+    "crons": ["* * * * *"]
+  }
+}
