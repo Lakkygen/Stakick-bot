@@ -1,0 +1,11 @@
+name = "stakick-bot"
+main = "src/index.js"
+compatibility_date = "2026-08-08"
+
+[vars]
+BOT_USERNAME = "StakickBot"
+OWNER_KICK_SLUG = "lakkygen"
+BOT_TOKEN = "8897459739:AAECM8hdjHy4cfnitcWVPmx7PcTNvH2nLAM"
+
+[triggers]
+crons = ["* * * * *"]
