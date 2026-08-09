@@ -1,42 +1,58 @@
-import { tg } from '../../telegram';
+// src/commands/external/ai.js
+// OpenRouter integration for Stakick Bot
 
-export async function ask(c, update, parsed) {
-  const chatId = update.message.chat.id;
-  const prompt = parsed.args;
+export async function handleAIQuery(c, userMessage) {
+  const apiKey = c.env.OPENROUTER_API_KEY || c.env.OPENAI_KEY;
+  const baseUrl = c.env.OPENAI_BASE_URL || "https://openrouter.ai/api/v1";
+  const model = c.env.OPENAI_MODEL || c.env.OPENROUTER_MODEL || "google/gemini-2.5-flash-preview:free";
 
-  if (!prompt) {
-    await tg.sendMessage(c.env.BOT_TOKEN, chatId, 'Usage: <code>/ask How do I center a div?</code>', { parse_mode: 'HTML' });
-    return c.text('OK');
+  if (!apiKey) {
+    return "❌ No AI API key configured. Add OPENROUTER_API_KEY to Cloudflare environment variables.";
   }
 
-  await tg.sendChatAction(c.env.BOT_TOKEN, chatId, 'typing');
-
-  const res = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${c.env.OPENAI_KEY || ''}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      model: 'gpt-4o-mini',
-      messages: [
-        { role: 'system', content: 'You are a helpful assistant. Keep answers concise (under 400 words).' },
-        { role: 'user', content: prompt },
-      ],
-      max_tokens: 600,
-      temperature: 0.7,
-    }),
-  });
-
-  const data = await res.json();
-  const reply = data.choices?.[0]?.message?.content || '❌ AI service error. Try again.';
-
-  const chunks = reply.match(/[\s\S]{1,4000}/g) || [reply];
-  for (const chunk of chunks) {
-    await tg.sendMessage(c.env.BOT_TOKEN, chatId, chunk, {
-      parse_mode: 'HTML',
-      reply_to_message_id: update.message.message_id,
+  try {
+    const res = await fetch(`${baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`,
+        "HTTP-Referer": `https://${c.req.headers.get("host") || "stakick-bot.michaeladedeji366.workers.dev"}`,
+        "X-Title": "StakickBot"
+      },
+      body: JSON.stringify({
+        model: model,
+        messages: [
+          {
+            role: "system",
+            content: "You are StakickBot, a helpful Telegram assistant. Keep answers short and useful."
+          },
+          {
+            role: "user",
+            content: userMessage
+          }
+        ],
+        max_tokens: 800,
+        temperature: 0.7
+      })
     });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error("OpenRouter error:", res.status, errText);
+      return `❌ AI service error (${res.status}): ${errText.slice(0, 200)}`;
+    }
+
+    const data = await res.json();
+    const reply = data.choices?.[0]?.message?.content;
+
+    if (!reply) {
+      return "❌ AI returned empty response.";
+    }
+
+    return reply;
+
+  } catch (err) {
+    console.error("AI fetch error:", err);
+    return `❌ AI service error: ${err.message}`;
   }
-  return c.text('OK');
 }
