@@ -21,15 +21,22 @@ const OWNER_ID = '6816397800';
 /**
  * Check if this chat/user is allowed to use the bot.
  * - Owner can use in private chat
- * - Only approved groups are allowed
+ * - Owner can run /approve in ANY group (even unapproved)
+ * - Only approved groups are allowed for everyone else
  */
 async function whitelistCheck(c, update) {
   const chatId = update.message?.chat?.id || update.callback_query?.message?.chat?.id;
   const userId = update.message?.from?.id || update.callback_query?.from?.id;
   const chatType = update.message?.chat?.type || update.callback_query?.message?.chat?.type;
+  const text = update.message?.text || '';
 
-  // Owner always allowed in private
+  // Owner always allowed in private chat
   if (chatType === 'private' && String(userId) === OWNER_ID) {
+    return true;
+  }
+
+  // FIX: Owner can always run /approve to authorize a group
+  if (String(userId) === OWNER_ID && text.trim().toLowerCase().startsWith('/approve')) {
     return true;
   }
 
