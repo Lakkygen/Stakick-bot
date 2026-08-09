@@ -7,7 +7,7 @@ import { rateLimit } from './middleware/rateLimit';
 import { logCommand } from './middleware/logger';
 import { handleNewMembers } from './commands/group/welcome';
 import { checkReminders } from './commands/external/remind';
-import { runMonitor } from './kick/monitor';
+import { runMonitor } from './kick/monitor';   // ✅ import monitor
 import { handleKickEventSub } from './kick/eventsub';
 
 const app = new Hono();
@@ -18,37 +18,20 @@ const app = new Hono();
 
 const OWNER_ID = '6816397800';
 
-/**
- * Check if this chat/user is allowed to use the bot.
- * - Owner can use in private chat
- * - Owner can run /approve in ANY group (even unapproved)
- * - Only approved groups are allowed for everyone else
- */
 async function whitelistCheck(c, update) {
   const chatId = update.message?.chat?.id || update.callback_query?.message?.chat?.id;
   const userId = update.message?.from?.id || update.callback_query?.from?.id;
   const chatType = update.message?.chat?.type || update.callback_query?.message?.chat?.type;
   const text = update.message?.text || '';
 
-  // Owner always allowed in private chat
-  if (chatType === 'private' && String(userId) === OWNER_ID) {
-    return true;
-  }
+  if (chatType === 'private' && String(userId) === OWNER_ID) return true;
+  if (String(userId) === OWNER_ID && text.trim().toLowerCase().startsWith('/approve')) return true;
 
-  // FIX: Owner can always run /approve to authorize a group
-  if (String(userId) === OWNER_ID && text.trim().toLowerCase().startsWith('/approve')) {
-    return true;
-  }
-
-  // Check approved groups list
   const whitelistRaw = await c.env.KV.get('bot_whitelist');
   const whitelist = whitelistRaw ? JSON.parse(whitelistRaw) : [];
 
-  if (whitelist.includes(String(chatId))) {
-    return true;
-  }
+  if (whitelist.includes(String(chatId))) return true;
 
-  // Not allowed — warn and block
   if (update.message) {
     await tg.sendMessage(
       c.env.BOT_TOKEN,
@@ -56,7 +39,6 @@ async function whitelistCheck(c, update) {
       '❌ This bot is private. Contact the owner to authorize this group.'
     );
   }
-
   return false;
 }
 
@@ -138,6 +120,20 @@ app.get('/health', (c) => {
 });
 
 // ============================================================
+// MANUAL MONITOR TRIGGER – FOR DEBUGGING
+// ============================================================
+app.get('/run', async (c) => {
+  console.log('🔥 Manual /run triggered');
+  try {
+    await runMonitor({ env: c.env, executionCtx: { waitUntil: () => {} } });
+    return c.json({ ok: true, message: 'Monitor executed. Check logs.' });
+  } catch (err) {
+    console.error('❌ /run error:', err);
+    return c.json({ ok: false, error: err.message });
+  }
+});
+
+// ============================================================
 // TELEGRAM WEBHOOK
 // ============================================================
 
@@ -146,7 +142,6 @@ app.post('/webhook', async (c) => {
     const update = await c.req.json();
     c.set('update', update);
 
-    // WHITELIST CHECK — block unauthorized groups
     const allowed = await whitelistCheck(c, update);
     if (!allowed) return c.text('OK');
 
@@ -160,7 +155,6 @@ app.post('/webhook', async (c) => {
       await c.env.KV.put('bot_username', update.message.from.username);
     }
 
-    // BOT ADDED / REMOVED FROM GROUP
     if (update.my_chat_member) {
       const chat = update.my_chat_member.chat;
       const newStatus = update.my_chat_member.new_chat_member?.status;
@@ -181,12 +175,10 @@ app.post('/webhook', async (c) => {
       return c.text('OK');
     }
 
-    // NEW MEMBERS
     if (update.message?.new_chat_members) {
       return await handleNewMembers(c, update);
     }
 
-    // CALLBACK QUERIES
     if (update.callback_query) {
       await tg.answerCallbackQuery(c.env.BOT_TOKEN, update.callback_query.id);
 
@@ -203,7 +195,6 @@ app.post('/webhook', async (c) => {
       return c.text('OK');
     }
 
-    // INPUT PARSING
     const botUsername = cachedUsername || c.env.BOT_USERNAME || '';
     const parsed = parseInput(update, botUsername);
 
@@ -211,14 +202,12 @@ app.post('/webhook', async (c) => {
 
     c.set('parsed', parsed);
 
-    // COMMAND ROUTING
     if (parsed.type === 'command' && parsed.command) {
       const cmdName = parsed.command
         .replace(/^\//, '')
         .split('@')[0]
         .toLowerCase();
 
-      // OWNER-ONLY APPROVE COMMAND
       if (cmdName === 'approve') {
         const userId = String(update.message?.from?.id);
         const chatId = update.message.chat.id;
@@ -265,7 +254,6 @@ app.post('/webhook', async (c) => {
       }
     }
 
-    // NATURAL LANGUAGE / AI
     if (parsed.type === 'natural' && parsed.isMention) {
       const reply = await handleOpenRouterAI(c, parsed.args || parsed.text || '');
 
