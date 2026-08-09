@@ -3,7 +3,7 @@ import { tg } from '../telegram';
 
 // REPLACE THIS with your actual Telegram numeric ID
 // Get it from @userinfobot on Telegram
-const OWNER_ID = 'LAKKYGEN';
+const OWNER_ID = '6816397800';
 
 export async function whitelistCheck(c, update) {
   const chatId = update.message?.chat?.id || update.callback_query?.message?.chat?.id;
