@@ -6,5 +6,14 @@ compatibility_date = "2026-08-08"
 BOT_USERNAME = "StakickBot"
 OWNER_KICK_SLUG = "lakkygen"
 
+[[kv_namespaces]]
+binding = "KV"
+id = "957dfd1492e34f07b00416e22110cacc"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "stakick-db"
+database_id = "735e166d-dc36-4a19-8fdb-f0b33ef41f90"
+
 [triggers]
 crons = ["* * * * *"]
