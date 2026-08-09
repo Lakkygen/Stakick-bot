@@ -1,6 +1,7 @@
 name = "stakick-bot"
 main = "src/index.js"
 compatibility_date = "2026-08-08"
+workers_dev = true
 
 [vars]
 BOT_USERNAME = "StakickBot"
