@@ -27,7 +27,7 @@ async function handleOpenRouterAI(c, userMessage) {
   const model = c.env.OPENAI_MODEL || c.env.OPENROUTER_MODEL || 'google/gemini-2.5-flash-preview:free';
 
   if (!apiKey) {
-    return '❌ No '❌ No AI API key configured. Add OPENROUTER_API_KEY to Cloudflare environment variables.';
+    return '❌ No AI API key configured. Add OPENROUTER_API_KEY to Cloudflare environment variables.';
   }
 
   try {
