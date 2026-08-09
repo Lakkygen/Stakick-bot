@@ -14,16 +14,15 @@ export async function ask(c, update, parsed) {
     return c.text('OK');
   }
 
-  // FIXED: Support both naming conventions + default free model
-  const apiKey = c.env.OPENROUTER_API_KEY || c.env.OPENAI_KEY;
+  // FIXED: Support both naming conventions
+  const apiKey = c.env.OPENROUTER_API_KEY || c.env.OPENAI_API_KEY || c.env.OPENAI_KEY;
   const model = c.env.OPENROUTER_MODEL || c.env.OPENAI_MODEL || 'google/gemini-2.5-flash-preview:free';
 
   if (!apiKey) {
-    console.error('OPENROUTER_API_KEY / OPENAI_KEY is not configured');
     await tg.sendMessage(
       c.env.BOT_TOKEN,
       chatId,
-      '❌ AI service is not configured. Please contact the bot administrator.',
+      '❌ AI API key not configured.',
       { parse_mode: 'HTML' }
     );
     return c.text('OK');
@@ -60,12 +59,11 @@ export async function ask(c, update, parsed) {
     const data = await res.json();
 
     if (!res.ok) {
-      console.error('OpenRouter API error:', res.status, JSON.stringify(data));
-      const errorMessage = data?.error?.message || data?.error?.metadata?.raw || `OpenRouter returned HTTP ${res.status}`;
+      const errorMessage = data?.error?.message || `HTTP ${res.status}`;
       await tg.sendMessage(
         c.env.BOT_TOKEN,
         chatId,
-        `❌ AI service error.\n\n<code>${escapeHtml(errorMessage)}</code>`,
+        `❌ AI error: <code>${errorMessage.slice(0, 200)}</code>`,
         { parse_mode: 'HTML' }
       );
       return c.text('OK');
@@ -74,12 +72,7 @@ export async function ask(c, update, parsed) {
     const reply = data?.choices?.[0]?.message?.content?.trim();
 
     if (!reply) {
-      console.error('OpenRouter returned no message:', JSON.stringify(data));
-      await tg.sendMessage(
-        c.env.BOT_TOKEN,
-        chatId,
-        '❌ The AI returned an empty response. Please try again.'
-      );
+      await tg.sendMessage(c.env.BOT_TOKEN, chatId, '❌ AI returned empty response.');
       return c.text('OK');
     }
 
@@ -100,20 +93,12 @@ export async function ask(c, update, parsed) {
     return c.text('OK');
 
   } catch (error) {
-    console.error('OpenRouter request failed:', error);
+    console.error('AI request failed:', error);
     await tg.sendMessage(
       c.env.BOT_TOKEN,
       chatId,
-      '❌ Could not connect to the AI service. Please try again shortly.'
+      '❌ Could not connect to AI service.'
     );
     return c.text('OK');
   }
-}
-
-function escapeHtml(text) {
-  return String(text)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
 }
