@@ -1,7 +1,7 @@
 // src/commands/admin/approve.js
 import { tg } from '../../telegram';
 
-const OWNER_ID = 'LAKKYGEN'; // Same as whitelist.js
+const OWNER_ID = '6816397800'; // Same as whitelist.js
 
 export async function approve(c, update, parsed) {
   const userId = update.message?.from?.id;
