@@ -1,17 +1,28 @@
 import { Hono } from 'hono';
+
 import { tg } from './telegram';
 import { parseInput } from './parser';
 import { commandRegistry } from './config';
+
 import { requireAdmin, requireGroup } from './middleware/auth';
 import { rateLimit } from './middleware/rateLimit';
 import { logCommand } from './middleware/logger';
+
 import { handleNewMembers } from './commands/group/welcome';
 import { checkReminders } from './commands/external/remind';
+
 import { runMonitor } from './kick/monitor';
 import { handleKickEventSub } from './kick/eventsub';
+
 import { ensureSchema } from './db';
 
 const app = new Hono();
+
+/**
+ * ============================================================
+ * MIDDLEWARE REGISTRY
+ * ============================================================
+ */
 
 const middlewareMap = {
   requireAdmin,
@@ -20,377 +31,325 @@ const middlewareMap = {
   logCommand,
 };
 
-// Prevent external/database operations from hanging forever.
-async function withTimeout(promise, ms, label = 'operation') {
-  let timer;
+/**
+ * ============================================================
+ * HEALTH / STATUS ROUTES
+ * ============================================================
+ */
 
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => {
-      reject(new Error(`${label} timed out after ${ms}ms`));
-    }, ms);
-  });
-
-  try {
-    return await Promise.race([promise, timeout]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-app.get('/', (c) =>
-  c.json({
+/**
+ * Root health check.
+ */
+app.get('/', (c) => {
+  return c.json({
     status: 'Stakick is alive',
-    owner: c.env.OWNER_KICK_SLUG,
-  })
-);
+    owner: c.env.OWNER_KICK_SLUG || 'unknown',
+    service: 'stakick-bot',
+    timestamp: new Date().toISOString(),
+  });
+});
+
+/**
+ * Dedicated health endpoint.
+ */
+app.get('/health', (c) => {
+  return c.json({
+    ok: true,
+    service: 'stakick-bot',
+    timestamp: new Date().toISOString(),
+  });
+});
+
+/**
+ * ============================================================
+ * TELEGRAM WEBHOOK
+ * ============================================================
+ */
 
 app.post('/webhook', async (c) => {
-  let update;
-
   try {
-    update = await c.req.json();
-  } catch (error) {
-    console.error('Invalid Telegram webhook JSON:', error);
-    return c.text('Bad Request', 400);
-  }
+    await ensureSchema(c.env);
 
-  c.set('update', update);
+    const update = await c.req.json();
 
-  /*
-   * IMPORTANT:
-   * Schema creation should never be allowed to freeze a Telegram update.
-   * If it fails/times out, the bot can still process normal commands.
-   */
-  try {
-    await withTimeout(
-      ensureSchema(c.env),
-      5000,
-      'D1 schema initialization'
-    );
-  } catch (error) {
-    console.error('ensureSchema failed:', error);
-  }
+    c.set('update', update);
 
-  // Cache bot username without allowing KV to freeze the update.
-  let cachedUsername = null;
+    /**
+     * Cache Telegram bot username.
+     */
+    const cachedUsername = await c.env.KV.get('bot_username');
 
-  try {
-    cachedUsername = await withTimeout(
-      c.env.KV.get('bot_username'),
-      3000,
-      'KV bot username lookup'
-    );
-  } catch (error) {
-    console.error('KV bot username lookup failed:', error);
-  }
-
-  if (
-    !cachedUsername &&
-    update.message?.from?.is_bot &&
-    update.message.from.username
-  ) {
-    try {
-      await withTimeout(
-        c.env.KV.put('bot_username', update.message.from.username),
-        3000,
-        'KV bot username write'
+    if (
+      !cachedUsername &&
+      update.message?.from?.is_bot &&
+      update.message?.from?.username
+    ) {
+      await c.env.KV.put(
+        'bot_username',
+        update.message.from.username
       );
-
-      cachedUsername = update.message.from.username;
-    } catch (error) {
-      console.error('KV bot username write failed:', error);
     }
-  }
 
-  // Handle bot added to group
-  if (update.my_chat_member) {
-    try {
+    /**
+     * ========================================================
+     * BOT ADDED / REMOVED FROM GROUP
+     * ========================================================
+     */
+
+    if (update.my_chat_member) {
       const chat = update.my_chat_member.chat;
-      const newStatus = update.my_chat_member.new_chat_member.status;
+      const newStatus =
+        update.my_chat_member.new_chat_member?.status;
 
-      if (newStatus === 'member' || newStatus === 'administrator') {
-        await withTimeout(
-          c.env.DB.prepare(
-            `INSERT INTO group_settings (chat_id, welcome_msg, updated_at)
-             VALUES (?, ?, ?)
-             ON CONFLICT(chat_id) DO NOTHING`
-          )
-            .bind(chat.id, null, Date.now())
-            .run(),
-          5000,
-          'D1 group initialization'
-        );
+      if (
+        newStatus === 'member' ||
+        newStatus === 'administrator'
+      ) {
+        await c.env.DB.prepare(
+          `
+          INSERT INTO group_settings
+            (chat_id, welcome_msg, updated_at)
+          VALUES (?, ?, ?)
+          ON CONFLICT(chat_id) DO NOTHING
+          `
+        )
+          .bind(chat.id, null, Date.now())
+          .run();
 
-        try {
-          const existingDefault = await withTimeout(
-            c.env.KV.get('default_notify_group'),
-            3000,
-            'KV default group lookup'
+        const existingDefault =
+          await c.env.KV.get('default_notify_group');
+
+        if (
+          !existingDefault &&
+          chat.type !== 'private'
+        ) {
+          await c.env.KV.put(
+            'default_notify_group',
+            String(chat.id)
           );
-
-          if (!existingDefault && chat.type !== 'private') {
-            await withTimeout(
-              c.env.KV.put(
-                'default_notify_group',
-                chat.id.toString()
-              ),
-              3000,
-              'KV default group write'
-            );
-          }
-        } catch (error) {
-          console.error('Default group KV operation failed:', error);
         }
       }
-    } catch (error) {
-      console.error('my_chat_member handling failed:', error);
-    }
 
-    return c.text('OK');
-  }
-
-  // Handle new members
-  if (update.message?.new_chat_members) {
-    try {
-      return await withTimeout(
-        handleNewMembers(c, update),
-        8000,
-        'new member handler'
-      );
-    } catch (error) {
-      console.error('New member handler failed:', error);
       return c.text('OK');
     }
-  }
 
-  // Handle callback queries
-  if (update.callback_query) {
-    try {
-      await withTimeout(
-        tg.answerCallbackQuery(
-          c.env.BOT_TOKEN,
-          update.callback_query.id
-        ),
-        5000,
-        'Telegram callback acknowledgement'
-      );
-    } catch (error) {
-      console.error('Callback acknowledgement failed:', error);
+    /**
+     * ========================================================
+     * NEW MEMBERS
+     * ========================================================
+     */
+
+    if (update.message?.new_chat_members) {
+      return await handleNewMembers(c, update);
     }
 
-    try {
+    /**
+     * ========================================================
+     * CALLBACK QUERIES
+     * ========================================================
+     */
+
+    if (update.callback_query) {
+      await tg.answerCallbackQuery(
+        c.env.BOT_TOKEN,
+        update.callback_query.id
+      );
+
       const data = update.callback_query.data;
-      const chatId = update.callback_query.message.chat.id;
+      const callbackMessage =
+        update.callback_query.message;
+
+      if (!callbackMessage) {
+        return c.text('OK');
+      }
 
       if (data === 'cmd_help') {
         const help = commandRegistry.help;
 
         if (help) {
-          await withTimeout(
-            help[0](
-              c,
-              {
-                message: update.callback_query.message,
-              },
-              {
-                args: '',
-              }
-            ),
-            8000,
-            'help command'
+          await help[0](
+            c,
+            { message: callbackMessage },
+            { args: '' }
           );
         }
       }
-    } catch (error) {
-      console.error('Callback command failed:', error);
-    }
 
-    return c.text('OK');
-  }
-
-  // Parse input
-  let parsed;
-
-  try {
-    const botUsername =
-      cachedUsername || c.env.BOT_USERNAME;
-
-    parsed = parseInput(update, botUsername);
-  } catch (error) {
-    console.error('Input parser failed:', error);
-    return c.text('OK');
-  }
-
-  if (!parsed) {
-    return c.text('OK');
-  }
-
-  c.set('parsed', parsed);
-
-  // Route commands
-  if (parsed.type === 'command' && parsed.command) {
-    const cmdName = parsed.command.replace('/', '');
-    const entry = commandRegistry[cmdName];
-
-    if (!entry) {
       return c.text('OK');
     }
 
-    try {
-      const [handler, middlewares, scope] = entry;
-      const chatType = update.message?.chat?.type;
+    /**
+     * ========================================================
+     * INPUT PARSING
+     * ========================================================
+     */
 
-      if (
-        scope === 'group' &&
-        chatType === 'private'
-      ) {
-        await withTimeout(
-          tg.sendMessage(
+    const botUsername =
+      cachedUsername ||
+      c.env.BOT_USERNAME ||
+      '';
+
+    const parsed = parseInput(
+      update,
+      botUsername
+    );
+
+    if (!parsed) {
+      return c.text('OK');
+    }
+
+    c.set('parsed', parsed);
+
+    /**
+     * ========================================================
+     * COMMAND ROUTING
+     * ========================================================
+     */
+
+    if (
+      parsed.type === 'command' &&
+      parsed.command
+    ) {
+      const cmdName = parsed.command
+        .replace(/^\//, '')
+        .split('@')[0]
+        .toLowerCase();
+
+      const entry = commandRegistry[cmdName];
+
+      if (entry) {
+        const [
+          handler,
+          middlewares = [],
+          scope,
+        ] = entry;
+
+        const chatType =
+          update.message?.chat?.type;
+
+        /**
+         * Group-only commands cannot run in private chats.
+         */
+        if (
+          scope === 'group' &&
+          chatType === 'private'
+        ) {
+          await tg.sendMessage(
             c.env.BOT_TOKEN,
             update.message.chat.id,
-            'Use this in a group!'
-          ),
-          5000,
-          'private command warning'
-        );
-
-        return c.text('OK');
-      }
-
-      // Run middleware safely.
-      for (const mwName of middlewares || []) {
-        const mw = middlewareMap[mwName];
-
-        if (!mw) continue;
-
-        let nextCalled = false;
-
-        const result = await withTimeout(
-          mw(c, () => {
-            nextCalled = true;
-          }),
-          8000,
-          `${mwName} middleware`
-        );
-
-        if (!nextCalled) {
-          return result || c.text('OK');
-        }
-      }
-
-      /*
-       * Run the command with a safety timeout.
-       *
-       * This does NOT cancel the underlying promise, but prevents
-       * the webhook request from waiting forever.
-       */
-      try {
-        const result = await withTimeout(
-          handler(c, update, parsed),
-          25000,
-          `${cmdName} command`
-        );
-
-        return result || c.text('OK');
-      } catch (error) {
-        console.error(
-          `Command /${cmdName} failed:`,
-          error
-        );
-
-        try {
-          await withTimeout(
-            tg.sendMessage(
-              c.env.BOT_TOKEN,
-              update.message.chat.id,
-              '❌ Something went wrong while processing that command. Please try again.'
-            ),
-            5000,
-            'command error message'
+            'Use this command in a group!'
           );
-        } catch (telegramError) {
-          console.error(
-            'Failed to send command error:',
-            telegramError
-          );
+
+          return c.text('OK');
         }
 
-        return c.text('OK');
-      }
-    } catch (error) {
-      console.error(
-        `Command routing failed for /${cmdName}:`,
-        error
-      );
+        /**
+         * Execute registered middleware.
+         */
+        for (const mwName of middlewares) {
+          const middleware =
+            middlewareMap[mwName];
 
-      return c.text('OK');
+          if (!middleware) {
+            continue;
+          }
+
+          let nextCalled = false;
+
+          const result = await middleware(
+            c,
+            () => {
+              nextCalled = true;
+            }
+          );
+
+          if (!nextCalled) {
+            return result || c.text('OK');
+          }
+        }
+
+        return await handler(
+          c,
+          update,
+          parsed
+        );
+      }
     }
-  }
 
-  // Natural language when tagged
-  if (
-    parsed.type === 'natural' &&
-    parsed.isMention
-  ) {
-    const aiEntry = commandRegistry.ask;
+    /**
+     * ========================================================
+     * NATURAL LANGUAGE / AI
+     * ========================================================
+     */
 
-    if (aiEntry) {
-      try {
+    if (
+      parsed.type === 'natural' &&
+      parsed.isMention
+    ) {
+      const aiEntry =
+        commandRegistry.ask;
+
+      if (aiEntry) {
         const fakeParsed = {
           ...parsed,
           args: parsed.args,
         };
 
-        await withTimeout(
-          aiEntry[0](c, update, fakeParsed),
-          30000,
-          'AI request'
+        return await aiEntry[0](
+          c,
+          update,
+          fakeParsed
         );
-      } catch (error) {
-        console.error(
-          'Natural language AI handler failed:',
-          error
-        );
-
-        try {
-          await withTimeout(
-            tg.sendMessage(
-              c.env.BOT_TOKEN,
-              update.message.chat.id,
-              '❌ The AI request timed out. Please try again.'
-            ),
-            5000,
-            'AI timeout message'
-          );
-        } catch (telegramError) {
-          console.error(
-            'Failed to send AI timeout message:',
-            telegramError
-          );
-        }
       }
     }
-  }
 
-  return c.text('OK');
-});
-
-app.post('/kick/eventsub', async (c) => {
-  try {
-    return await withTimeout(
-      handleKickEventSub(c),
-      10000,
-      'Kick EventSub handler'
-    );
+    return c.text('OK');
   } catch (error) {
     console.error(
-      'Kick EventSub handler failed:',
+      'Telegram webhook error:',
       error
     );
 
-    return c.text('OK');
+    return c.json(
+      {
+        ok: false,
+        error: 'Webhook processing failed',
+      },
+      500
+    );
   }
 });
+
+/**
+ * ============================================================
+ * KICK EVENTSUB
+ * ============================================================
+ */
+
+app.post('/kick/eventsub', async (c) => {
+  try {
+    return await handleKickEventSub(c);
+  } catch (error) {
+    console.error(
+      'Kick EventSub error:',
+      error
+    );
+
+    return c.json(
+      {
+        ok: false,
+        error: 'Kick EventSub processing failed',
+      },
+      500
+    );
+  }
+});
+
+/**
+ * ============================================================
+ * KICK OAUTH CALLBACK
+ * ============================================================
+ */
 
 app.get('/kick/oauth/callback', async (c) => {
   try {
@@ -398,85 +357,82 @@ app.get('/kick/oauth/callback', async (c) => {
     const state = c.req.query('state');
 
     if (!code || !state) {
-      return c.text('Missing params', 400);
+      return c.text(
+        'Missing OAuth parameters.',
+        400
+      );
     }
 
-    const chatId = await withTimeout(
-      c.env.KV.get(`oauth_state:${state}`),
-      5000,
-      'OAuth state lookup'
+    const chatId = await c.env.KV.get(
+      `oauth_state:${state}`
     );
 
     if (!chatId) {
-      return c.text('Invalid or expired state', 400);
+      return c.text(
+        'Invalid or expired OAuth state.',
+        400
+      );
     }
 
-    const res = await withTimeout(
-      fetch('https://id.kick.com/oauth/token', {
+    const host =
+      c.req.header('host');
+
+    const redirectUri =
+      `https://${host}/kick/oauth/callback`;
+
+    const response = await fetch(
+      'https://id.kick.com/oauth/token',
+      {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          grant_type: 'authorization_code',
-          client_id: c.env.KICK_CLIENT_ID,
-          client_secret: c.env.KICK_CLIENT_SECRET,
+          grant_type:
+            'authorization_code',
+          client_id:
+            c.env.KICK_CLIENT_ID,
+          client_secret:
+            c.env.KICK_CLIENT_SECRET,
           code,
-          redirect_uri: `https://${c.req.headers.get(
-            'host'
-          )}/kick/oauth/callback`,
+          redirect_uri:
+            redirectUri,
         }),
-      }),
-      10000,
-      'Kick OAuth token request'
+      }
     );
 
-    const data = await res.json();
+    const data = await response.json();
 
     if (data.access_token) {
-      await withTimeout(
-        c.env.KV.put(
-          'kick_user_token',
-          data.access_token,
-          {
-            expirationTtl: 3500,
-          }
-        ),
-        5000,
-        'Kick token storage'
+      await c.env.KV.put(
+        'kick_user_token',
+        data.access_token,
+        {
+          expirationTtl: 3500,
+        }
       );
 
       if (data.refresh_token) {
-        await withTimeout(
-          c.env.KV.put(
-            'kick_refresh_token_backup',
-            data.refresh_token
-          ),
-          5000,
-          'Kick refresh token storage'
+        await c.env.KV.put(
+          'kick_refresh_token_backup',
+          data.refresh_token
         );
       }
 
-      await withTimeout(
-        tg.sendMessage(
-          c.env.BOT_TOKEN,
-          parseInt(chatId),
-          '✅ Kick account linked successfully!'
-        ),
-        5000,
-        'Kick OAuth Telegram message'
+      await tg.sendMessage(
+        c.env.BOT_TOKEN,
+        Number(chatId),
+        '✅ Kick account linked successfully!'
       );
     } else {
-      await withTimeout(
-        tg.sendMessage(
-          c.env.BOT_TOKEN,
-          parseInt(chatId),
-          `❌ OAuth failed: ${
-            data.error_description || 'Unknown'
-          }`
-        ),
-        5000,
-        'Kick OAuth error message'
+      await tg.sendMessage(
+        c.env.BOT_TOKEN,
+        Number(chatId),
+        `❌ OAuth failed: ${
+          data.error_description ||
+          data.error ||
+          'Unknown error'
+        }`
       );
     }
 
@@ -484,24 +440,71 @@ app.get('/kick/oauth/callback', async (c) => {
       'OAuth complete. You can close this tab.'
     );
   } catch (error) {
-    console.error('Kick OAuth callback failed:', error);
+    console.error(
+      'Kick OAuth callback error:',
+      error
+    );
 
     return c.text(
-      'OAuth failed. Please try again.',
+      'OAuth processing failed.',
       500
     );
   }
 });
 
+/**
+ * ============================================================
+ * TELEGRAM SETUP
+ * ============================================================
+ *
+ * GET /setup
+ *
+ * Optional protection:
+ *
+ * /setup?key=YOUR_SETUP_SECRET
+ *
+ * This endpoint:
+ * 1. Ensures the database schema exists.
+ * 2. Registers the Telegram webhook.
+ * 3. Gets the Telegram bot information.
+ * 4. Stores the bot username in KV.
+ * 5. Returns Telegram webhook status.
+ *
+ * ============================================================
+ */
+
 app.get('/setup', async (c) => {
   try {
-    await withTimeout(
-      ensureSchema(c.env),
-      5000,
-      'setup schema initialization'
-    );
+    /**
+     * Make sure required environment bindings exist.
+     */
+    if (!c.env.BOT_TOKEN) {
+      return c.json(
+        {
+          ok: false,
+          error:
+            'BOT_TOKEN is not configured as a Worker secret.',
+        },
+        500
+      );
+    }
 
-    const setupSecret = c.env.SETUP_SECRET;
+    if (!c.env.KV) {
+      return c.json(
+        {
+          ok: false,
+          error:
+            'KV binding is missing from the Worker.',
+        },
+        500
+      );
+    }
+
+    /**
+     * Optional setup protection.
+     */
+    const setupSecret =
+      c.env.SETUP_SECRET;
 
     if (
       setupSecret &&
@@ -509,6 +512,7 @@ app.get('/setup', async (c) => {
     ) {
       return c.json(
         {
+          ok: false,
           error:
             'Unauthorized. Provide the setup key.',
         },
@@ -516,16 +520,49 @@ app.get('/setup', async (c) => {
       );
     }
 
-    const host = c.req.headers.get('host');
-    const webhookUrl = `https://${host}/webhook`;
+    /**
+     * Initialize database schema.
+     */
+    await ensureSchema(c.env);
 
-    const res = await withTimeout(
-      fetch(
+    /**
+     * Always use the host from the current request.
+     * This means setup works on both:
+     *
+     * workers.dev
+     * custom domains
+     */
+    const host =
+      c.req.header('host');
+
+    if (!host) {
+      return c.json(
+        {
+          ok: false,
+          error:
+            'Unable to determine Worker hostname.',
+        },
+        500
+      );
+    }
+
+    const webhookUrl =
+      `https://${host}/webhook`;
+
+    /**
+     * ========================================================
+     * REGISTER TELEGRAM WEBHOOK
+     * ========================================================
+     */
+
+    const setWebhookResponse =
+      await fetch(
         `https://api.telegram.org/bot${c.env.BOT_TOKEN}/setWebhook`,
         {
           method: 'POST',
           headers: {
-            'Content-Type': 'application/json',
+            'Content-Type':
+              'application/json',
           },
           body: JSON.stringify({
             url: webhookUrl,
@@ -538,93 +575,193 @@ app.get('/setup', async (c) => {
             drop_pending_updates: true,
           }),
         }
-      ),
-      10000,
-      'Telegram setWebhook'
-    );
+      );
 
-    const meRes = await withTimeout(
-      fetch(
+    const setWebhookData =
+      await setWebhookResponse.json();
+
+    /**
+     * ========================================================
+     * GET BOT INFORMATION
+     * ========================================================
+     */
+
+    const meResponse =
+      await fetch(
         `https://api.telegram.org/bot${c.env.BOT_TOKEN}/getMe`
-      ),
-      10000,
-      'Telegram getMe'
-    );
+      );
 
-    const meData = await meRes.json();
+    const meData =
+      await meResponse.json();
 
-    if (meData.ok) {
-      await withTimeout(
-        c.env.KV.put(
-          'bot_username',
-          meData.result.username
-        ),
-        5000,
-        'bot username setup'
+    /**
+     * Store Telegram username in KV.
+     */
+    if (
+      meData?.ok &&
+      meData?.result?.username
+    ) {
+      await c.env.KV.put(
+        'bot_username',
+        meData.result.username
       );
     }
 
-    const info = await withTimeout(
-      fetch(
+    /**
+     * ========================================================
+     * GET WEBHOOK STATUS
+     * ========================================================
+     */
+
+    const webhookResponse =
+      await fetch(
         `https://api.telegram.org/bot${c.env.BOT_TOKEN}/getWebhookInfo`
-      ),
-      10000,
-      'Telegram getWebhookInfo'
-    );
+      );
+
+    const webhookData =
+      await webhookResponse.json();
+
+    /**
+     * ========================================================
+     * SETUP RESPONSE
+     * ========================================================
+     */
 
     return c.json({
-      setup: await res.json(),
-      bot: meData.result,
-      webhook: await info.json(),
+      ok:
+        Boolean(setWebhookData?.ok) &&
+        Boolean(meData?.ok),
+
+      service: 'stakick-bot',
+
+      webhook: {
+        url: webhookUrl,
+        registration:
+          setWebhookData,
+        status:
+          webhookData,
+      },
+
+      bot: meData?.ok
+        ? {
+            id:
+              meData.result.id,
+            username:
+              meData.result.username,
+            first_name:
+              meData.result.first_name,
+            is_bot:
+              meData.result.is_bot,
+          }
+        : {
+            error:
+              meData?.description ||
+              'Unable to retrieve bot information.',
+          },
+
+      timestamp:
+        new Date().toISOString(),
     });
   } catch (error) {
-    console.error('Setup failed:', error);
+    console.error(
+      'Setup endpoint error:',
+      error
+    );
 
     return c.json(
       {
-        error: 'Setup failed',
-        message: error.message,
+        ok: false,
+        error: 'Setup failed.',
+        message:
+          error instanceof Error
+            ? error.message
+            : 'Unknown error',
       },
       500
     );
   }
 });
 
-export default {
-  async fetch(request, env, ctx) {
-    try {
-      return await app.fetch(request, env, ctx);
-    } catch (error) {
-      console.error('Unhandled Worker error:', error);
+/**
+ * ============================================================
+ * EXPLICIT 404 HANDLER
+ * ============================================================
+ *
+ * This is intentionally explicit so you can immediately see
+ * whether a request is actually reaching this Worker.
+ * ============================================================
+ */
 
-      return new Response('OK', {
-        status: 200,
-        headers: {
-          'Content-Type': 'text/plain',
-        },
-      });
-    }
+app.notFound((c) => {
+  return c.json(
+    {
+      ok: false,
+      error: 'Route not found',
+      path: new URL(
+        c.req.url
+      ).pathname,
+      method: c.req.method,
+      service: 'stakick-bot',
+    },
+    404
+  );
+});
+
+/**
+ * ============================================================
+ * GLOBAL ERROR HANDLER
+ * ============================================================
+ */
+
+app.onError((error, c) => {
+  console.error(
+    'Unhandled Worker error:',
+    error
+  );
+
+  return c.json(
+    {
+      ok: false,
+      error: 'Internal server error',
+    },
+    500
+  );
+});
+
+/**
+ * ============================================================
+ * CLOUDFLARE WORKER EXPORT
+ * ============================================================
+ */
+
+export default {
+  /**
+   * HTTP requests.
+   */
+  async fetch(request, env, ctx) {
+    return app.fetch(
+      request,
+      env,
+      ctx
+    );
   },
 
-  async scheduled(controller, env, ctx) {
+  /**
+   * Cron execution.
+   */
+  async scheduled(
+    controller,
+    env,
+    ctx
+  ) {
     ctx.waitUntil(
-      ensureSchema(env).catch((error) => {
-        console.error(
-          'Scheduled schema check failed:',
-          error
-        );
-      })
+      ensureSchema(env)
     );
 
     ctx.waitUntil(
       runMonitor({
         env,
         executionCtx: ctx,
-      }).catch((error) => {
-        console.error(
-          'Scheduled Kick monitor failed:',
-          error
-        );
       })
     );
 
@@ -632,11 +769,6 @@ export default {
       checkReminders({
         env,
         executionCtx: ctx,
-      }).catch((error) => {
-        console.error(
-          'Scheduled reminders failed:',
-          error
-        );
       })
     );
   },
