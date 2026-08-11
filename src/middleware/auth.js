@@ -19,7 +19,6 @@ export async function requireAdmin(c, next) {
     await tg.sendMessage(c.env.BOT_TOKEN, msg.chat.id, '⛔ Admins only, buddy.');
     return c.text('OK');
   }
-
   return next();
 }
 
