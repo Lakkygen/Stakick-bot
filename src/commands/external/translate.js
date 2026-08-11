@@ -6,7 +6,7 @@ export async function translate(c, update, parsed) {
 
   if (parts.length < 3) {
     await tg.sendMessage(c.env.BOT_TOKEN, chatId,
-      'Usage: <code>/translate en es Hello world</code>\nFormat: /translate [from] [to] [text]', { parse_mode: 'HTML' });
+      'Usage: <code>/translate en es Hello world</code>\\nFormat: /translate [from] [to] [text]', { parse_mode: 'HTML' });
     return c.text('OK');
   }
 
@@ -22,6 +22,6 @@ export async function translate(c, update, parsed) {
   const translated = data.responseData?.translatedText || 'Translation failed.';
 
   await tg.sendMessage(c.env.BOT_TOKEN, chatId,
-    `🔄 <b>Translation</b> (${from} → ${to}):\n<i>${translated}</i>`, { parse_mode: 'HTML' });
+    `🔄 <b>Translation</b> (${from} → ${to}):\\n<i>${translated}</i>`, { parse_mode: 'HTML' });
   return c.text('OK');
 }
