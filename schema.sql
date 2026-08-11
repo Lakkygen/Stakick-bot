@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS user_stats (
 CREATE TABLE IF NOT EXISTS kick_channels (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   slug TEXT NOT NULL,
+  broadcaster_user_id TEXT,
   name TEXT,
   notify_chat_id INTEGER NOT NULL,
   active INTEGER DEFAULT 1,
@@ -50,6 +51,8 @@ CREATE TABLE IF NOT EXISTS kick_channels (
   last_viewer_count INTEGER DEFAULT 0,
   last_category TEXT,
   last_checked INTEGER,
+  fail_count INTEGER DEFAULT 0,
+  last_error TEXT,
   UNIQUE(slug, notify_chat_id)
 );
 
@@ -84,4 +87,24 @@ CREATE TABLE IF NOT EXISTS bot_config (
   key TEXT PRIMARY KEY,
   value TEXT,
   updated_at INTEGER
+);
+
+-- Monitoring & health tables
+CREATE TABLE IF NOT EXISTS bot_health_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  check_type TEXT NOT NULL,
+  status TEXT NOT NULL,
+  details TEXT,
+  latency_ms INTEGER,
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS channel_errors (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  channel_slug TEXT NOT NULL,
+  error_type TEXT NOT NULL,
+  error_message TEXT,
+  fail_count INTEGER DEFAULT 1,
+  first_seen INTEGER NOT NULL,
+  last_seen INTEGER NOT NULL
 );
