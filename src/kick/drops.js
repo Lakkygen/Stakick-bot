@@ -1,22 +1,22 @@
 import { tg } from '../telegram';
 
 const DROP_PATTERNS = [
-  { label: 'drops / drop', regex: /drops?/i, weight: 1 },
-  { label: 'reward / rewards', regex: /rewards?/i, weight: 1 },
-  { label: 'bonus', regex: /bonus/i, weight: 1 },
-  { label: 'campaign', regex: /campaign/i, weight: 1 },
-  { label: 'claim / redeem', regex: /(claim|redeem)/i, weight: 2 },
+  { label: 'drops / drop', regex: /\bdrops?\b/i, weight: 1 },
+  { label: 'reward / rewards', regex: /\brewards?\b/i, weight: 1 },
+  { label: 'bonus', regex: /\bbonus\b/i, weight: 1 },
+  { label: 'campaign', regex: /\bcampaign\b/i, weight: 1 },
+  { label: 'claim / redeem', regex: /\b(claim|redeem)\b/i, weight: 2 },
   { label: 'watch to earn', regex: /watch\s+to\s+earn/i, weight: 3 },
   { label: 'active drops', regex: /active\s+drops?/i, weight: 3 },
   { label: 'drop rewards', regex: /drop\s+rewards?/i, weight: 3 },
   { label: 'earn rewards', regex: /earn\s+rewards?/i, weight: 3 },
   { label: 'drops enabled', regex: /drops?\s+(are\s+)?(enabled|active|on)/i, weight: 3 },
   { label: 'rewards enabled', regex: /rewards?\s+(are\s+)?(enabled|active|on)/i, weight: 3 },
-  { label: 'giveaway / prize', regex: /(giveaway|prize|loot)/i, weight: 1 },
+  { label: 'giveaway / prize', regex: /\b(giveaway|prize|loot)\b/i, weight: 1 },
 ];
 
 const FIELD_HINTS = /drop|reward|bonus|campaign|quest|claim|redeem|giveaway|prize|loot|challenge|perk/i;
-const ACTIVE_HINTS = /(true|yes|on|enabled|active|available|live)/i;
+const ACTIVE_HINTS = /\b(true|yes|on|enabled|active|available|live)\b/i;
 
 function pushText(entries, path, value) {
   if (typeof value !== 'string') return;
@@ -116,8 +116,8 @@ export function scanDropSignals(info, livestream) {
   const confidence = score >= 10 || (score >= 6 && strong)
     ? 'high'
     : score >= 4
-      ? 'medium'
-      : 'low';
+    ? 'medium'
+    : 'low';
 
   return { score, confidence, reasons: uniq };
 }
@@ -128,23 +128,7 @@ function buildAlertText(ch, livestream, report) {
     .map(r => r.label)
     .join(', ');
 
-  return `🎁 <b>DROP ALERT!</b>
-
-` +
-    `🔴 <b>${name}</b> looks like it has active drops/rewards.
-` +
-    `📺 ${livestream.session_title || 'Live stream'}
-` +
-    `👁 ${livestream.viewer_count?.toLocaleString() || '?'} viewers
-` +
-    `🎮 ${livestream.categories?.[0]?.name || 'N/A'}
-` +
-    (reasonLine ? `🧠 Signals: ${reasonLine}
-` : '') +
-    `⚡ <a href="https://kick.com/${ch.slug}">OPEN KICK & CLAIM</a>
-
-` +
-    `<i>Confidence: ${report.confidence}. This alert only detects signals — you still need to watch on Kick to qualify.</i>`;
+  return `🎁 <b>DROP ALERT!</b>\n\n🔴 <b>${name}</b> looks like it has active drops/rewards.\n📺 ${livestream.session_title || 'Live stream'}\n👁 ${livestream.viewer_count?.toLocaleString() || '?'} viewers\n🎮 ${livestream.categories?.[0]?.name || 'N/A'}\n${reasonLine ? `🧠 Signals: ${reasonLine}\n` : ''}⚡ OPEN KICK & CLAIM\n\n<i>Confidence: ${report.confidence}. This alert only detects signals — you still need to watch on Kick to qualify.</i>`;
 }
 
 export async function detectDrops(env, chatId, ch, livestream) {
