@@ -24,9 +24,9 @@ database_id = "735e166d-dc36-4a19-8fdb-f0b33ef41f90"
 name = "DROP_ALARM"
 class_name = "DropAlarm"
 
-[exports.DropAlarm]
-type = "durable-object"
-storage = "sqlite"
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["DropAlarm"]
 
 [triggers]
 crons = ["* * * * *"]
