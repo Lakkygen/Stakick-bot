@@ -18,33 +18,33 @@ export async function kickWatch(c, update, parsed) {
 
   const slug = (parsed.args || '').trim().toLowerCase().replace(/^@/, '');
   if (!slug) {
-    await tg.sendMessage(c.env.BOT_TOKEN, chatId,
-      'Usage: <code>/kickwatch xqc</code>', { parse_mode: 'HTML' });
+    await tg.sendMessage(c.env.BOT_TOKEN, chatId, 'Usage: <code>/kickwatch xqc</code>', { parse_mode: 'HTML' });
     return c.text('OK');
   }
 
-  const info = await fetchChannelInfo(slug);
+  const info = await fetchChannelInfo(slug, c.env);
   if (!info) {
-    await tg.sendMessage(c.env.BOT_TOKEN, chatId, `❌ Channel "<b>${slug}</b>" not found.`, { parse_mode: 'HTML' });
+    await tg.sendMessage(c.env.BOT_TOKEN, chatId, `❌ Channel \"<b>${slug}</b>\" not found.`, { parse_mode: 'HTML' });
     return c.text('OK');
   }
+
+  const broadcasterId = info.user_id || info.id || null;
 
   await c.env.DB.prepare(
-    `INSERT INTO kick_channels (slug, name, notify_chat_id, active, added_by, added_at, last_checked)
-     VALUES (?, ?, ?, 1, ?, ?, ?)
+    `INSERT INTO kick_channels (slug, broadcaster_user_id, name, notify_chat_id, active, added_by, added_at, last_checked)
+     VALUES (?, ?, ?, ?, 1, ?, ?, ?)
      ON CONFLICT(slug, notify_chat_id) DO UPDATE SET
-       active = 1,
-       name = excluded.name,
-       last_checked = excluded.last_checked`
-  ).bind(slug, info.user?.username || slug, notifyChatId, update.message.from.id, Date.now(), Date.now() - 60000).run();
+     active = 1, name = excluded.name, broadcaster_user_id = excluded.broadcaster_user_id,
+     last_checked = excluded.last_checked`
+  ).bind(slug, broadcasterId, info.user?.username || slug, notifyChatId, update.message.from.id, Date.now(), Date.now() - 60000).run();
 
   const live = info.livestream;
   const status = live
-    ? `🔴 Currently LIVE (${live.viewer_count?.toLocaleString()} viewers)\n📺 ${live.session_title}`
+    ? `🔴 Currently LIVE (${live.viewer_count?.toLocaleString()} viewers)\\n📺 ${live.session_title}`
     : '⚫ Offline';
 
   await tg.sendMessage(c.env.BOT_TOKEN, chatId,
-    `✅ Now watching <b>${slug}</b>!\n${status}\n\nAlerts: go-live, milestones, title changes, drops.`, { parse_mode: 'HTML' });
+    `✅ Now watching <b>${slug}</b>!\\n${status}\\n\\nAlerts: go-live, milestones, title changes, drops.`, { parse_mode: 'HTML' });
   return c.text('OK');
 }
 
@@ -52,7 +52,7 @@ export async function kickUnwatch(c, update, parsed) {
   const chatId = update.message.chat.id;
   const slug = (parsed.args || '').trim().toLowerCase();
   if (!slug) {
-    await tg.sendMessage(c.env.BOT_TOKEN, chatId, 'Usage: <code>/kickunwatch xqc</code>');
+    await tg.sendMessage(c.env.BOT_TOKEN, chatId, 'Usage: <code>/kickunwatch xqc</code>', { parse_mode: 'HTML' });
     return c.text('OK');
   }
   await c.env.DB.prepare(
@@ -80,16 +80,16 @@ export async function kickList(c, update, parsed) {
       ? `🔴 LIVE — ${r.last_viewer_count?.toLocaleString()} viewers`
       : '⚫ Offline';
     return `• <b>${r.slug}</b> — ${status}`;
-  }).join('\n');
+  }).join('\\n');
 
-  await tg.sendMessage(c.env.BOT_TOKEN, chatId, `<b>📺 Watched Kick Channels:</b>\n${list}`, { parse_mode: 'HTML' });
+  await tg.sendMessage(c.env.BOT_TOKEN, chatId, `📺 <b>Watched Kick Channels:</b>\\n${list}`, { parse_mode: 'HTML' });
   return c.text('OK');
 }
 
 export async function kickStatus(c, update, parsed) {
   const chatId = update.message.chat.id;
   const slug = (parsed.args || c.env.OWNER_KICK_SLUG).trim().toLowerCase();
-  const info = await fetchChannelInfo(slug);
+  const info = await fetchChannelInfo(slug, c.env);
   if (!info) {
     await tg.sendMessage(c.env.BOT_TOKEN, chatId, `❌ Not found.`);
     return c.text('OK');
@@ -97,8 +97,8 @@ export async function kickStatus(c, update, parsed) {
 
   const live = info.livestream;
   const text = live
-    ? `🔴 <b>${slug}</b> is LIVE\n📺 ${live.session_title}\n👁 ${live.viewer_count?.toLocaleString()} viewers\n🎮 ${live.categories?.[0]?.name || 'N/A'}\n🔗 https://kick.com/${slug}`
-    : `⚫ <b>${slug}</b> is offline\n👥 ${info.followers_count?.toLocaleString() || '?'} followers\n🔗 https://kick.com/${slug}`;
+    ? `🔴 <b>${slug}</b> is LIVE\\n📺 ${live.session_title}\\n👁 ${live.viewer_count?.toLocaleString()} viewers\\n🎮 ${live.categories?.[0]?.name || 'N/A'}\\n🔗 https://kick.com/${slug}`
+    : `⚫ <b>${slug}</b> is offline\\n👥 ${info.followers_count?.toLocaleString() || '?'} followers\\n🔗 https://kick.com/${slug}`;
 
   await tg.sendMessage(c.env.BOT_TOKEN, chatId, text, { parse_mode: 'HTML', disable_web_page_preview: false });
   return c.text('OK');
@@ -120,14 +120,14 @@ export async function kickDrops(c, update, parsed) {
 
     const list = rows.results.map(r => {
       const time = new Date(r.detected_at).toLocaleString();
-      return `• <b>${r.channel_slug}</b>: ${r.title}\n  <i>${time}</i>`;
-    }).join('\n');
+      return `• <b>${r.channel_slug}</b>: ${r.title}\\n<i>${time}</i>`;
+    }).join('\\n');
 
-    await tg.sendMessage(c.env.BOT_TOKEN, chatId, `<b>🎁 Recent Drop Alerts:</b>\n${list}`, { parse_mode: 'HTML' });
+    await tg.sendMessage(c.env.BOT_TOKEN, chatId, `🎁 <b>Recent Drop Alerts:</b>\\n${list}`, { parse_mode: 'HTML' });
     return c.text('OK');
   }
 
-  const info = await fetchChannelInfo(slug);
+  const info = await fetchChannelInfo(slug, c.env);
   if (!info?.livestream) {
     await tg.sendMessage(c.env.BOT_TOKEN, chatId, `${slug} is offline.`);
     return c.text('OK');
@@ -159,14 +159,15 @@ export async function kickLink(c, update, parsed) {
   const state = crypto.randomUUID();
   await c.env.KV.put(`oauth_state:${state}`, chatId.toString(), { expirationTtl: 600 });
 
-  const redirectUri = `https://${c.req.headers.get('host')}/kick/oauth/callback`;
+  const host = c.req.header('host');
+  const redirectUri = `https://${host}/kick/oauth/callback`;
   const authUrl = `https://id.kick.com/oauth/authorize?` + new URLSearchParams({
     response_type: 'code', client_id: c.env.KICK_CLIENT_ID, redirect_uri: redirectUri,
     scope: 'chat:write channel:read channel:write moderation:ban moderation:timeout user:read events:subscribe', state
   });
 
   await tg.sendMessage(c.env.BOT_TOKEN, chatId,
-    `<a href="${authUrl}">🔗 Link your Kick account</a>`, { parse_mode: 'HTML' });
+    `🔗 <a href=\"${authUrl}\">Link your Kick account</a>`, { parse_mode: 'HTML' });
   return c.text('OK');
 }
 
@@ -179,7 +180,7 @@ export async function kickClips(c, update, parsed) {
     return c.text('OK');
   }
 
-  const list = clips.map((clip, i) => `${i+1}. <b>${clip.title || 'Clip'}</b> — <a href="https://kick.com/${slug}?clip=${clip.id}">Watch</a>`).join('\n');
-  await tg.sendMessage(c.env.BOT_TOKEN, chatId, `🎬 <b>${slug}</b> Clips:\n${list}`, { parse_mode: 'HTML' });
+  const list = clips.map((clip, i) => `${i+1}. <b>${clip.title || 'Clip'}</b> — <a href=\"https://kick.com/${slug}?clip=${clip.id}\">Watch</a>`).join('\\n');
+  await tg.sendMessage(c.env.BOT_TOKEN, chatId, `🎬 <b>${slug}</b> Clips:\\n${list}`, { parse_mode: 'HTML' });
   return c.text('OK');
 }
