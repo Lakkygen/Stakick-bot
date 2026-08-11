@@ -1,13 +1,7 @@
 name = "stakick-bot"
 main = "src/index.js"
-compatibility_date = "2026-08-08"
+compatibility_date = "2026-08-11"
 workers_dev = true
-
-============================================================
-
-ENVIRONMENT VARIABLES
-
-============================================================
 
 [vars]
 BOT_USERNAME = "StakickBot"
@@ -15,32 +9,22 @@ OWNER_KICK_SLUG = "lakkygen"
 OWNER_ID = "6816397800"
 ENVIRONMENT = "production"
 
-============================================================
-
-KV NAMESPACE
-
-============================================================
-
 [[kv_namespaces]]
 binding = "KV"
 id = "957dfd1492e34f07b00416e22110cacc"
-
-============================================================
-
-D1 DATABASE
-
-============================================================
 
 [[d1_databases]]
 binding = "DB"
 database_name = "stakick-db"
 database_id = "735e166d-dc36-4a19-8fdb-f0b33ef41f90"
 
-============================================================
+[[durable_objects.bindings]]
+name = "DROP_ALARM"
+class_name = "DropAlarm"
 
-CRON TRIGGER
-
-============================================================
+[exports.DropAlarm]
+type = "durable-object"
+storage = "sqlite"
 
 [triggers]
 crons = ["* * * * *"]
