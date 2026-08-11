@@ -9,14 +9,91 @@ OWNER_KICK_SLUG = "lakkygen"
 OWNER_ID = "6816397800"
 ENVIRONMENT = "production"
 
+============================================================
+
+KV — monitor state, deduplication, alerts, OAuth, settings
+
+============================================================
+
 [[kv_namespaces]]
 binding = "KV"
 id = "957dfd1492e34f07b00416e22110cacc"
+
+============================================================
+
+D1 — persistent bot/channel/database state
+
+============================================================
 
 [[d1_databases]]
 binding = "DB"
 database_name = "stakick-db"
 database_id = "735e166d-dc36-4a19-8fdb-f0b33ef41f90"
 
+============================================================
+
+CRON — primary scheduler
+
+Runs every minute.
+
+The monitor itself decides:
+
+• which campaigns need urgent attention
+
+• which tracked streamers need polling
+
+• which offline streamers can be skipped
+
+• when pre-alerts should fire
+
+• when active-drop checks should happen
+
+Cloudflare Cron does not support a 15–20 second expression.
+
+============================================================
+
 [triggers]
 crons = ["* * * * *"]
+
+============================================================
+
+DURABLE OBJECT — high-frequency digital alarm
+
+Used by the upgraded index.js / alarm handler for:
+
+• 15–20 second drop monitoring windows
+
+• precise campaign countdowns
+
+• high-priority upcoming drops
+
+• persistent scheduled work
+
+The actual alarm logic will live in src/index.js.
+
+============================================================
+
+[durable_objects]
+bindings = [
+{ name = "STAKICK_ALARM", class_name = "StakickAlarm" }
+]
+
+============================================================
+
+DURABLE OBJECT MIGRATION
+
+============================================================
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["StakickAlarm"]
+
+============================================================
+
+OBSERVABILITY
+
+============================================================
+
+[observability]
+enabled = true
+head_sampling_rate = 1
