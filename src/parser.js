@@ -7,7 +7,6 @@ export function parseInput(update, botUsername) {
   const isPrivate = chatType === 'private';
   const entities = message.entities || [];
 
-  // In private chat, no mention required
   if (isPrivate) {
     return {
       type: text.startsWith('/') ? 'command' : 'natural',
@@ -18,7 +17,6 @@ export function parseInput(update, botUsername) {
     };
   }
 
-  // In groups: must be mentioned or replied to bot
   const mentionPattern = new RegExp(`@${botUsername}\\b`, 'i');
   const hasTextMention = mentionPattern.test(text);
 
