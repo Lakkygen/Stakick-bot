@@ -6,6 +6,8 @@ workers_dev = true
 [vars]
 BOT_USERNAME = "StakickBot"
 OWNER_KICK_SLUG = "lakkygen"
+OWNER_ID = "6816397800"
+ENVIRONMENT = "production"
 
 [[kv_namespaces]]
 binding = "KV"
