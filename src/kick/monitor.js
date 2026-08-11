@@ -1,28 +1,40 @@
 import { tg } from '../telegram';
-import { fetchChannelInfo } from './api';
 
 // ============================================================
-// STAKICK PREMIUM MONITOR
+// STAKICK MONITOR — PRODUCTION / PREMIUM
 // ============================================================
 //
-// Goals:
-// 1. Detect any campaign the Kick drops API exposes.
-// 2. DO NOT discard future campaigns.
-// 3. Alert immediately on first API sighting.
-// 4. Alert again at 60s and 15s before starts_at.
-// 5. Alert again when the drop becomes active.
-// 6. Handle short-lived Stake drops that may disappear quickly.
-// 7. Fetch the drops inventory ONCE per monitor run.
-// 8. Match campaign.channels[] from the actual API structure.
-// 9. Deduplicate notifications with KV.
-// 10. Continue normal stream monitoring.
-// 11. Work with 1-minute Cron OR ~15-20s Durable Object alarms.
+// Design goals:
+//
+// 1. Drops API is the EARLIEST discovery source.
+// 2. Never discard future campaigns just because starts_at
+//    has not arrived.
+// 3. Notify immediately when a relevant campaign is first seen.
+// 4. Give pre-start alerts at 120 / 60 / 30 / 15 / 5 seconds.
+// 5. Give an ACTIVE NOW alert.
+// 6. Only notify campaigns that match tracked channels.
+// 7. Stream monitoring only uses kick_channels WHERE active=1.
+// 8. Fetch Drops API exactly once per execution.
+// 9. Fetch tracked-channel DB rows exactly once per execution.
+// 10. Prioritize live/relevant/owner channels.
+// 11. Dynamic offline polling:
+//       - 5 minutes normally
+//       - 60 seconds when a drop may involve the channel
+// 12. Abort channel and drops requests properly.
+// 13. Deduplicate notifications through KV.
+// 14. Preserve campaign firstSeen / lastSeen telemetry.
+// 15. Tolerate campaigns disappearing after short-lived drops.
+// 16. Strong HTML escaping.
+// 17. Avoid one broken streamer breaking the entire scan.
+// 18. Keep execution inside the Worker budget.
+// 19. Compatible with 1-minute Cron today and sub-minute
+//     invocation later without rewriting the monitor.
 //
 // ============================================================
 
-// ----------------------------
-// Performance / tuning
-// ----------------------------
+// ------------------------------------------------------------
+// PERFORMANCE
+// ------------------------------------------------------------
 
 const VIEWER_MILESTONES = [
   500,
@@ -38,29 +50,46 @@ const VIEWER_MILESTONES = [
 const MAX_CONCURRENT = 5;
 const MAX_CHANNELS_PER_RUN = 30;
 
-const API_TIMEOUT_MS = 4000;
+const CHANNEL_FETCH_TIMEOUT_MS = 3500;
 const DROP_FETCH_TIMEOUT_MS = 4000;
 
-const CRON_BUDGET_MS = 50000;
+const WORKER_BUDGET_MS = 50000;
 
-// Offline streamers do not need aggressive polling because
-// global drop discovery is handled separately.
-const OFFLINE_SKIP_MS = 60000;
+// Normal offline channels do NOT need constant polling.
+// Relevant channels get checked much more aggressively.
+const OFFLINE_SKIP_LONG_MS = 5 * 60 * 1000;
+const OFFLINE_SKIP_SHORT_MS = 60 * 1000;
 
+// If an API failure happens repeatedly, progressively back off.
 const BACKOFF_THRESHOLD = 2;
 const MAX_BACKOFF_MINUTES = 15;
 
-// Upcoming-drop notifications.
-// Initial discovery is immediate.
-// These are additional pre-start alerts.
-const DROP_PREALERT_SECONDS = [60, 15];
+// Pre-start warning ladder.
+// The campaign itself is still detected immediately.
+const DROP_PREALERT_SECONDS = [
+  120,
+  60,
+  30,
+  15,
+  5
+];
 
+// State retention.
 const DROP_STATE_TTL = 7 * 24 * 60 * 60;
 const DROP_ALERT_TTL = 7 * 24 * 60 * 60;
 
-// ============================================================
+// How long to retain a "campaign last seen" marker.
+const DROP_LAST_SEEN_TTL = 7 * 24 * 60 * 60;
+
+// By default, campaigns with NO explicit channels are not
+// broadcast to every tracked chat because that creates noise.
+// We still log/store them.
+// Set env.ALERT_UNSCOPED_DROPS = "true" later if you want them.
+const ALERT_UNSCOPED_DROPS = false;
+
+// ------------------------------------------------------------
 // GENERIC HELPERS
-// ============================================================
+// ------------------------------------------------------------
 
 function nowMs() {
   return Date.now();
@@ -69,8 +98,11 @@ function nowMs() {
 function safeDateMs(value) {
   if (!value) return null;
 
-  const ms = new Date(value).getTime();
-  return Number.isFinite(ms) ? ms : null;
+  const parsed = new Date(value).getTime();
+
+  return Number.isFinite(parsed)
+    ? parsed
+    : null;
 }
 
 function escapeHtml(value) {
@@ -82,17 +114,28 @@ function escapeHtml(value) {
     .replaceAll("'", '&#039;');
 }
 
+function normalizeSlug(value) {
+  return String(value ?? '').trim().toLowerCase();
+}
+
+function normalizeId(value) {
+  if (value == null) return null;
+  return String(value);
+}
+
 function formatDuration(seconds) {
   if (!Number.isFinite(seconds)) return '?';
 
-  if (seconds <= 0) return 'now';
+  if (seconds <= 0) {
+    return 'now';
+  }
 
-  const s = Math.floor(seconds);
+  const total = Math.floor(seconds);
 
-  const days = Math.floor(s / 86400);
-  const hours = Math.floor((s % 86400) / 3600);
-  const minutes = Math.floor((s % 3600) / 60);
-  const secs = s % 60;
+  const days = Math.floor(total / 86400);
+  const hours = Math.floor((total % 86400) / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const secs = total % 60;
 
   if (days > 0) {
     return `${days}d ${hours}h`;
@@ -109,22 +152,47 @@ function formatDuration(seconds) {
   return `${secs}s`;
 }
 
-function campaignStartMs(campaign) {
+function unique(values) {
+  const seen = new Set();
+  const output = [];
+
+  for (const value of values) {
+    if (value == null) continue;
+
+    const key = String(value);
+
+    if (seen.has(key)) continue;
+
+    seen.add(key);
+    output.push(value);
+  }
+
+  return output;
+}
+
+// ============================================================
+// CAMPAIGN TIME / STATE
+// ============================================================
+
+function getCampaignStartMs(campaign) {
   return safeDateMs(campaign?.starts_at);
 }
 
-function campaignEndMs(campaign) {
+function getCampaignEndMs(campaign) {
   return safeDateMs(campaign?.ends_at);
 }
 
 function isCampaignExpired(campaign, now = nowMs()) {
-  const end = campaignEndMs(campaign);
+  const end = getCampaignEndMs(campaign);
 
   if (end && now >= end) {
     return true;
   }
 
-  if (String(campaign?.status || '').toLowerCase() === 'expired') {
+  if (
+    String(campaign?.status || '').toLowerCase() ===
+    'expired'
+  ) {
     return true;
   }
 
@@ -136,7 +204,7 @@ function isCampaignActive(campaign, now = nowMs()) {
     return false;
   }
 
-  const start = campaignStartMs(campaign);
+  const start = getCampaignStartMs(campaign);
 
   if (start && now < start) {
     return false;
@@ -149,12 +217,12 @@ function isCampaignActive(campaign, now = nowMs()) {
   return true;
 }
 
-function campaignState(campaign, now = nowMs()) {
+function getCampaignState(campaign, now = nowMs()) {
   if (isCampaignExpired(campaign, now)) {
     return 'expired';
   }
 
-  const start = campaignStartMs(campaign);
+  const start = getCampaignStartMs(campaign);
 
   if (start && now < start) {
     return 'upcoming';
@@ -168,7 +236,8 @@ function campaignState(campaign, now = nowMs()) {
 // ============================================================
 
 async function fetchCampaigns(env) {
-  const baseUrl = 'https://web.kick.com/api/v1/drops/campaigns';
+  const url =
+    'https://web.kick.com/api/v1/drops/campaigns';
 
   const headers = {
     'User-Agent':
@@ -178,80 +247,89 @@ async function fetchCampaigns(env) {
     Pragma: 'no-cache',
 
     ...(env.KICK_SESSION_TOKEN && {
-      Authorization: `Bearer ${env.KICK_SESSION_TOKEN}`
+      Authorization:
+        `Bearer ${env.KICK_SESSION_TOKEN}`
     })
   };
 
-  const controller = new AbortController();
+  const controller =
+    new AbortController();
 
-  const timer = setTimeout(
-    () => controller.abort(),
-    DROP_FETCH_TIMEOUT_MS
-  );
+  const timer =
+    setTimeout(
+      () => controller.abort(),
+      DROP_FETCH_TIMEOUT_MS
+    );
 
   try {
-    const response = await fetch(baseUrl, {
-      method: 'GET',
-      headers,
-      signal: controller.signal,
-      cf: {
-        cacheTtl: 0,
-        cacheEverything: false
-      }
-    });
+    const response =
+      await fetch(url, {
+        method: 'GET',
+        headers,
+        signal: controller.signal,
+        cf: {
+          cacheTtl: 0,
+          cacheEverything: false
+        }
+      });
 
     if (!response.ok) {
-      throw new Error(`Drops API HTTP ${response.status}`);
+      throw new Error(
+        `Drops API HTTP ${response.status}`
+      );
     }
 
-    const payload = await response.json();
+    const payload =
+      await response.json();
 
     /*
-     * Your real response was:
+     * Supports the actual response you showed:
      *
      * {
-     *   "data": [...],
-     *   "message": "Success"
+     *   data: [...],
+     *   message: "Success"
      * }
      *
-     * But we also support:
-     *
-     * {
-     *   "campaigns": [...]
-     * }
+     * Also supports alternate structures.
      */
 
-    let campaigns = [];
-
     if (Array.isArray(payload)) {
-      campaigns = payload;
-    } else if (Array.isArray(payload?.data)) {
-      campaigns = payload.data;
-    } else if (Array.isArray(payload?.campaigns)) {
-      campaigns = payload.campaigns;
+      return payload.filter(Boolean);
     }
 
-    return campaigns.filter(Boolean);
+    if (Array.isArray(payload?.data)) {
+      return payload.data.filter(Boolean);
+    }
+
+    if (Array.isArray(payload?.campaigns)) {
+      return payload.campaigns.filter(Boolean);
+    }
+
+    return [];
   } catch (error) {
     console.error(
-      'fetchCampaigns error:',
+      'fetchCampaigns:',
       error?.name === 'AbortError'
         ? 'timeout'
         : error?.message || error
     );
 
-    return [];
+    return null;
   } finally {
     clearTimeout(timer);
   }
 }
 
 // ============================================================
-// CAMPAIGN IDENTIFIERS / CHANNELS
+// CAMPAIGN NORMALIZATION
 // ============================================================
 
 function getCampaignId(campaign) {
-  return campaign?.id || campaign?.campaign_id || null;
+  return (
+    campaign?.id ||
+    campaign?.campaign_id ||
+    null
+  );
 }
 
 function getCampaignName(campaign) {
@@ -262,7 +340,10 @@ function getCampaignName(campaign) {
   );
 }
 
-function getCampaignUrl(campaign, fallbackSlug = null) {
+function getCampaignUrl(
+  campaign,
+  fallbackSlug = null
+) {
   return (
     campaign?.url ||
     (fallbackSlug
@@ -271,22 +352,136 @@ function getCampaignUrl(campaign, fallbackSlug = null) {
   );
 }
 
-function getCampaignChannels(campaign) {
-  if (!Array.isArray(campaign?.channels)) {
-    return [];
+/*
+ * Normalizes all channel representations we know about
+ * into one simple structure:
+ *
+ * {
+ *   id,
+ *   userId,
+ *   slug,
+ *   username
+ * }
+ */
+function getCampaignChannelKeys(campaign) {
+  const result = [];
+  const seen = new Set();
+
+  function add(item) {
+    if (!item) return;
+
+    const id =
+      item?.id != null
+        ? normalizeId(item.id)
+        : null;
+
+    const userId =
+      item?.user?.id != null
+        ? normalizeId(item.user.id)
+        : null;
+
+    const slug =
+      normalizeSlug(item?.slug);
+
+    const username =
+      normalizeSlug(item?.user?.username);
+
+    const key = [
+      id || '',
+      userId || '',
+      slug,
+      username
+    ].join('|');
+
+    if (
+      key === '|||'
+    ) {
+      return;
+    }
+
+    if (seen.has(key)) {
+      return;
+    }
+
+    seen.add(key);
+
+    result.push({
+      id,
+      userId,
+      slug,
+      username
+    });
   }
 
-  return campaign.channels;
-}
+  /*
+   * Primary structure from your real API response:
+   *
+   * campaign.channels[]
+   */
+  if (Array.isArray(campaign?.channels)) {
+    for (const channel of campaign.channels) {
+      add(channel);
+    }
+  }
 
-function getCampaignChannelSlugs(campaign) {
-  return getCampaignChannels(campaign)
-    .map(channel => String(channel?.slug || '').toLowerCase())
-    .filter(Boolean);
+  /*
+   * Legacy channel IDs.
+   */
+  if (Array.isArray(campaign?.channel_ids)) {
+    for (const id of campaign.channel_ids) {
+      add({
+        id
+      });
+    }
+  }
+
+  /*
+   * Legacy channel slugs.
+   */
+  if (Array.isArray(campaign?.channel_slugs)) {
+    for (const slug of campaign.channel_slugs) {
+      add({
+        slug
+      });
+    }
+  }
+
+  /*
+   * Alternate streamer / creator structure.
+   */
+  if (campaign?.streamer) {
+    add({
+      id: campaign.streamer.id,
+      slug: campaign.streamer.slug,
+      user: {
+        id: campaign.streamer.user?.id,
+        username:
+          campaign.streamer.username ||
+          campaign.streamer.user?.username
+      }
+    });
+  }
+
+  if (campaign?.creator) {
+    add({
+      id: campaign.creator.id,
+      slug: campaign.creator.slug,
+      user: {
+        id: campaign.creator.user?.id,
+        username:
+          campaign.creator.username ||
+          campaign.creator.user?.username
+      }
+    });
+  }
+
+  return result;
 }
 
 function getCampaignRewards(campaign) {
-  if (Array.isArray(campaign?.rewards)) {
+  if (
+    Array.isArray(campaign?.rewards)
+  ) {
     return campaign.rewards;
   }
 
@@ -294,7 +489,8 @@ function getCampaignRewards(campaign) {
 }
 
 function getCampaignRewardText(campaign) {
-  const rewards = getCampaignRewards(campaign);
+  const rewards =
+    getCampaignRewards(campaign);
 
   if (!rewards.length) {
     return 'Unknown';
@@ -303,7 +499,10 @@ function getCampaignRewardText(campaign) {
   return rewards
     .slice(0, 3)
     .map(reward => {
-      const name = reward?.name || 'Reward';
+      const name =
+        reward?.name ||
+        'Reward';
+
       const units =
         reward?.required_units != null
           ? ` (${reward.required_units} units)`
@@ -315,207 +514,272 @@ function getCampaignRewardText(campaign) {
 }
 
 function getCampaignWatchText(campaign) {
-  const rewards = getCampaignRewards(campaign);
+  const rewards =
+    getCampaignRewards(campaign);
 
-  if (rewards.length) {
-    const units = rewards
-      .map(r => r?.required_units)
-      .filter(v => Number.isFinite(Number(v)));
+  const requiredUnits =
+    rewards
+      .map(reward =>
+        Number(reward?.required_units)
+      )
+      .filter(Number.isFinite);
 
-    if (units.length) {
-      return `${Math.min(...units)} required units`;
-    }
+  if (requiredUnits.length) {
+    return `${Math.min(...requiredUnits)} required units`;
   }
 
-  const seconds =
+  const watchSeconds =
     campaign?.watch_seconds ??
-    (campaign?.watch_time_minutes
-      ? Number(campaign.watch_time_minutes) * 60
-      : null);
+    (
+      campaign?.watch_time_minutes != null
+        ? Number(
+            campaign.watch_time_minutes
+          ) * 60
+        : null
+    );
 
-  if (Number.isFinite(Number(seconds))) {
-    return `${Math.ceil(Number(seconds) / 60)} min watch`;
+  if (
+    Number.isFinite(
+      Number(watchSeconds)
+    )
+  ) {
+    return `${Math.ceil(
+      Number(watchSeconds) / 60
+    )} min watch`;
   }
 
   return 'Watch to redeem';
 }
 
 // ============================================================
-// CAMPAIGN ↔ CHANNEL MATCHING
+// TRACKED CHANNEL INDEX
 // ============================================================
 
-function campaignInvolvesChannel(campaign, channel) {
-  if (!campaign || !channel) {
+function buildTrackedChannelIndex(
+  trackedChannels
+) {
+  const bySlug =
+    new Map();
+
+  const byId =
+    new Map();
+
+  const byUserId =
+    new Map();
+
+  for (const channel of trackedChannels) {
+    const slug =
+      normalizeSlug(channel.slug);
+
+    const id =
+      normalizeId(channel.id);
+
+    const broadcasterUserId =
+      normalizeId(
+        channel.broadcaster_user_id
+      );
+
+    if (slug) {
+      bySlug.set(slug, channel);
+    }
+
+    if (id) {
+      byId.set(id, channel);
+    }
+
+    if (broadcasterUserId) {
+      byUserId.set(
+        broadcasterUserId,
+        channel
+      );
+    }
+  }
+
+  return {
+    bySlug,
+    byId,
+    byUserId
+  };
+}
+
+function campaignMatchesTrackedChannel(
+  campaign,
+  channel
+) {
+  if (!channel) {
     return false;
   }
 
-  const slug = String(channel.slug || '').toLowerCase();
+  const channelKeys =
+    getCampaignChannelKeys(
+      campaign
+    );
 
-  const channelId = channel.broadcaster_user_id != null
-    ? String(channel.broadcaster_user_id)
-    : null;
-
-  if (!slug && !channelId) {
+  if (!channelKeys.length) {
     return false;
   }
 
-  const campaignChannels = getCampaignChannels(campaign);
+  const trackedSlug =
+    normalizeSlug(channel.slug);
 
-  for (const candidate of campaignChannels) {
-    const candidateSlug =
-      String(candidate?.slug || '').toLowerCase();
+  const trackedDbId =
+    normalizeId(channel.id);
 
-    const candidateId =
-      candidate?.id != null
-        ? String(candidate.id)
-        : null;
+  const trackedBroadcasterId =
+    normalizeId(
+      channel.broadcaster_user_id
+    );
 
-    const candidateUserId =
-      candidate?.user?.id != null
-        ? String(candidate.user.id)
-        : null;
-
-    const candidateUsername =
-      String(candidate?.user?.username || '').toLowerCase();
-
-    if (slug && candidateSlug === slug) {
-      return true;
-    }
-
+  for (const candidate of channelKeys) {
     if (
-      channelId &&
-      candidateId &&
-      channelId === candidateId
+      trackedSlug &&
+      (
+        candidate.slug === trackedSlug ||
+        candidate.username === trackedSlug
+      )
     ) {
       return true;
     }
 
     if (
-      channelId &&
-      candidateUserId &&
-      channelId === candidateUserId
+      trackedDbId &&
+      candidate.id === trackedDbId
     ) {
       return true;
     }
 
     if (
-      slug &&
-      candidateUsername === slug
+      trackedBroadcasterId &&
+      (
+        candidate.id === trackedBroadcasterId ||
+        candidate.userId === trackedBroadcasterId
+      )
     ) {
       return true;
     }
-  }
-
-  // Compatibility with alternate response formats.
-  if (
-    channelId &&
-    Array.isArray(campaign.channel_ids) &&
-    campaign.channel_ids.some(
-      id => String(id) === channelId
-    )
-  ) {
-    return true;
-  }
-
-  if (
-    slug &&
-    Array.isArray(campaign.channel_slugs) &&
-    campaign.channel_slugs.some(
-      value => String(value).toLowerCase() === slug
-    )
-  ) {
-    return true;
-  }
-
-  const streamer =
-    campaign?.streamer?.username ||
-    campaign?.creator?.username ||
-    '';
-
-  if (
-    slug &&
-    String(streamer).toLowerCase() === slug
-  ) {
-    return true;
   }
 
   return false;
 }
 
-// ============================================================
-// CAMPAIGN TARGET RESOLUTION
-// ============================================================
-
-async function getNotificationTargets(env, campaign) {
-  const rows = await env.DB.prepare(
-    `SELECT
-       id,
-       slug,
-       name,
-       broadcaster_user_id,
-       notify_chat_id,
-       active,
-       last_is_live
-     FROM kick_channels
-     WHERE active = 1`
-  ).all();
-
-  const tracked = rows.results || [];
-
-  if (!tracked.length) {
+function getMatchedTrackedChannels(
+  campaign,
+  trackedChannels
+) {
+  if (
+    !Array.isArray(
+      trackedChannels
+    ) ||
+    !trackedChannels.length
+  ) {
     return [];
   }
 
-  const campaignChannels = getCampaignChannels(campaign);
-
-  /*
-   * If Kick gives explicit channels, notify only chats tracking
-   * those channels.
-   */
-  if (campaignChannels.length) {
-    const matched = tracked.filter(channel =>
-      campaignInvolvesChannel(campaign, channel)
-    );
-
-    return uniqueChatIds(
-      matched.map(channel => channel.notify_chat_id)
-    );
-  }
-
-  /*
-   * Generic campaign without explicit channels:
-   * notify all active notification targets.
-   */
-  return uniqueChatIds(
-    tracked.map(channel => channel.notify_chat_id)
+  return trackedChannels.filter(
+    channel =>
+      campaignMatchesTrackedChannel(
+        campaign,
+        channel
+      )
   );
 }
 
-function uniqueChatIds(values) {
-  const output = [];
-  const seen = new Set();
+// ============================================================
+// RELEVANT DROP SET
+// ============================================================
 
-  for (const value of values) {
-    if (value == null) continue;
+function buildRelevantDropSet(
+  campaigns
+) {
+  const set =
+    new Set();
 
-    const normalized = String(value);
+  for (const campaign of campaigns) {
+    if (
+      isCampaignExpired(
+        campaign
+      )
+    ) {
+      continue;
+    }
 
-    if (seen.has(normalized)) continue;
+    for (
+      const candidate
+      of getCampaignChannelKeys(
+        campaign
+      )
+    ) {
+      if (candidate.slug) {
+        set.add(
+          `slug:${candidate.slug}`
+        );
+      }
 
-    seen.add(normalized);
-    output.push(value);
+      if (candidate.username) {
+        set.add(
+          `slug:${candidate.username}`
+        );
+      }
+
+      if (candidate.id) {
+        set.add(
+          `id:${candidate.id}`
+        );
+      }
+
+      if (candidate.userId) {
+        set.add(
+          `user:${candidate.userId}`
+        );
+      }
+    }
   }
 
-  return output;
+  return set;
+}
+
+function channelIsDropRelevant(
+  channel,
+  relevantDropSet
+) {
+  const slug =
+    normalizeSlug(channel.slug);
+
+  const dbId =
+    normalizeId(channel.id);
+
+  const userId =
+    normalizeId(
+      channel.broadcaster_user_id
+    );
+
+  return (
+    (slug &&
+      relevantDropSet.has(
+        `slug:${slug}`
+      )) ||
+    (dbId &&
+      relevantDropSet.has(
+        `id:${dbId}`
+      )) ||
+    (userId &&
+      relevantDropSet.has(
+        `user:${userId}`
+      ))
+  );
 }
 
 // ============================================================
-// KV STATE
+// KV JSON STATE
 // ============================================================
 
-async function getJson(env, key) {
+async function getJson(
+  env,
+  key
+) {
   try {
-    const value = await env.KV.get(key);
+    const value =
+      await env.KV.get(key);
 
     if (!value) {
       return null;
@@ -527,15 +791,26 @@ async function getJson(env, key) {
   }
 }
 
-async function putJson(env, key, value, ttl = DROP_STATE_TTL) {
+async function putJson(
+  env,
+  key,
+  value,
+  ttl = DROP_STATE_TTL
+) {
   await env.KV.put(
     key,
     JSON.stringify(value),
-    { expirationTtl: ttl }
+    {
+      expirationTtl: ttl
+    }
   );
 }
 
-async function hasAlert(env, campaignId, stage) {
+async function hasAlert(
+  env,
+  campaignId,
+  stage
+) {
   return Boolean(
     await env.KV.get(
       `drop_alert:${campaignId}:${stage}`
@@ -543,80 +818,154 @@ async function hasAlert(env, campaignId, stage) {
   );
 }
 
-async function markAlert(env, campaignId, stage) {
+async function markAlert(
+  env,
+  campaignId,
+  stage
+) {
   await env.KV.put(
     `drop_alert:${campaignId}:${stage}`,
     '1',
-    { expirationTtl: DROP_ALERT_TTL }
+    {
+      expirationTtl:
+        DROP_ALERT_TTL
+    }
   );
 }
 
 // ============================================================
-// DROP MESSAGE FORMATTERS
+// CAMPAIGN TARGET RESOLUTION
 // ============================================================
 
-function buildDropMessage(
+function getNotificationTargets(
+  matchedChannels
+) {
+  return unique(
+    matchedChannels
+      .map(
+        channel =>
+          channel.notify_chat_id
+      )
+      .filter(Boolean)
+  );
+}
+
+// ============================================================
+// DROP MESSAGE BUILDING
+// ============================================================
+
+function buildDropMessage({
   campaign,
   mode,
   remainingSeconds = null,
-  trackedSlug = null
-) {
-  const name = escapeHtml(getCampaignName(campaign));
-  const reward = escapeHtml(getCampaignRewardText(campaign));
-  const watch = escapeHtml(getCampaignWatchText(campaign));
+  matchedChannels = []
+}) {
+  const name =
+    escapeHtml(
+      getCampaignName(
+        campaign
+      )
+    );
 
-  const channels = getCampaignChannels(campaign);
+  const reward =
+    escapeHtml(
+      getCampaignRewardText(
+        campaign
+      )
+    );
 
-  const channelText = trackedSlug
-    ? `👤 <b>${escapeHtml(trackedSlug)}</b>`
-    : channels.length
-      ? `👥 ${channels.length} channel${channels.length === 1 ? '' : 's'}`
-      : '👥 Channel not specified';
+  const watch =
+    escapeHtml(
+      getCampaignWatchText(
+        campaign
+      )
+    );
 
-  const start = campaignStartMs(campaign);
-
-  let timing = '';
+  let timing =
+    '⚡ <b>API DETECTED</b>';
 
   if (mode === 'discovered') {
-    if (start && remainingSeconds != null && remainingSeconds > 0) {
+    if (
+      Number.isFinite(
+        remainingSeconds
+      ) &&
+      remainingSeconds > 0
+    ) {
       timing =
         `⏳ Starts in <b>${escapeHtml(
-          formatDuration(remainingSeconds)
+          formatDuration(
+            remainingSeconds
+          )
         )}</b>`;
-    } else if (start && remainingSeconds <= 0) {
-      timing = `🔴 <b>LIVE / ACTIVE NOW</b>`;
     } else {
-      timing = `⚡ <b>API DETECTED</b>`;
+      timing =
+        '🔴 <b>ACTIVE NOW</b>';
     }
   }
 
   if (mode === 'prealert') {
     timing =
       `⏳ Starts in <b>${escapeHtml(
-        formatDuration(remainingSeconds)
+        formatDuration(
+          remainingSeconds
+        )
       )}</b>`;
   }
 
   if (mode === 'active') {
-    timing = `🔴 <b>DROP LIVE NOW</b>`;
+    timing =
+      '🔴 <b>DROP LIVE NOW — JOIN NOW</b>';
   }
 
+  let streamerText =
+    '👤 Streamer: unknown';
+
+  if (
+    matchedChannels.length
+  ) {
+    const names =
+      unique(
+        matchedChannels.map(
+          channel =>
+            channel.name ||
+            channel.slug
+        )
+      );
+
+    streamerText =
+      names.length === 1
+        ? `👤 <b>${escapeHtml(
+            names[0]
+          )}</b>`
+        : `👥 <b>${escapeHtml(
+            names.join(', ')
+          )}</b>`;
+  }
+
+  const urlSlug =
+    matchedChannels.length === 1
+      ? matchedChannels[0].slug
+      : null;
+
   return (
-    `🎁 <b>KICK DROP</b>\n` +
+    `🎁 <b>STA/KICK DROP</b>\n` +
     `━━━━━━━━━━━━━━\n` +
     `📛 ${name}\n` +
-    `${channelText}\n` +
+    `${streamerText}\n` +
     `🎁 ${reward}\n` +
     `⏱ ${watch}\n` +
     `${timing}\n` +
     `🔗 ${escapeHtml(
-      getCampaignUrl(campaign, trackedSlug)
+      getCampaignUrl(
+        campaign,
+        urlSlug
+      )
     )}`
   );
 }
 
 // ============================================================
-// SEND WITH DEDUPLICATION
+// ALERT SENDER
 // ============================================================
 
 async function sendDropAlert({
@@ -624,176 +973,411 @@ async function sendDropAlert({
   campaign,
   stage,
   mode,
-  targets,
-  remainingSeconds = null,
-  trackedSlug = null,
+  matchedChannels,
+  remainingSeconds,
   stats
 }) {
-  const campaignId = getCampaignId(campaign);
+  const campaignId =
+    getCampaignId(
+      campaign
+    );
 
   if (!campaignId) {
     return false;
   }
 
-  if (await hasAlert(env, campaignId, stage)) {
-    return false;
-  }
-
-  if (!targets.length) {
-    return false;
-  }
-
-  const message = buildDropMessage(
-    campaign,
-    mode,
-    remainingSeconds,
-    trackedSlug
-  );
-
-  let sent = false;
-
-  for (const chatId of targets) {
-    try {
-      await tg.sendMessage(
-        env.BOT_TOKEN,
-        chatId,
-        message,
-        { parse_mode: 'HTML' }
-      );
-
-      sent = true;
-    } catch (error) {
-      console.error(
-        `drop alert failed (${campaignId}/${stage}) -> ${chatId}:`,
-        error?.message || error
-      );
-    }
-  }
-
-  if (sent) {
-    await markAlert(
+  if (
+    await hasAlert(
       env,
       campaignId,
       stage
-    );
-
-    stats.drops++;
-    stats.alerts++;
-
-    return true;
+    )
+  ) {
+    return false;
   }
 
-  return false;
+  const chatIds =
+    getNotificationTargets(
+      matchedChannels
+    );
+
+  if (!chatIds.length) {
+    return false;
+  }
+
+  const message =
+    buildDropMessage({
+      campaign,
+      mode,
+      remainingSeconds,
+      matchedChannels
+    });
+
+  let successful =
+    0;
+
+  /*
+   * We normally have very few target chats.
+   * Parallel sends reduce notification latency.
+   */
+  await Promise.all(
+    chatIds.map(
+      async chatId => {
+        try {
+          await tg.sendMessage(
+            env.BOT_TOKEN,
+            chatId,
+            message,
+            {
+              parse_mode: 'HTML'
+            }
+          );
+
+          successful++;
+        } catch (error) {
+          console.error(
+            `drop alert failed ` +
+            `(${campaignId}/${stage}) ` +
+            `chat=${chatId}:`,
+            error?.message ||
+              error
+          );
+        }
+      }
+    )
+  );
+
+  if (!successful) {
+    return false;
+  }
+
+  await markAlert(
+    env,
+    campaignId,
+    stage
+  );
+
+  stats.drops++;
+  stats.alerts++;
+
+  return true;
 }
 
 // ============================================================
-// DROP CAMPAIGN ENGINE
+// CAMPAIGN ENGINE
 // ============================================================
 
-async function processCampaign(
+async function processCampaign({
   env,
   campaign,
+  trackedChannels,
   stats
-) {
-  const campaignId = getCampaignId(campaign);
+}) {
+  const campaignId =
+    getCampaignId(
+      campaign
+    );
 
   if (!campaignId) {
     return;
   }
 
-  const now = nowMs();
+  const now =
+    nowMs();
 
-  if (isCampaignExpired(campaign, now)) {
+  if (
+    isCampaignExpired(
+      campaign,
+      now
+    )
+  ) {
     return;
   }
 
-  const start = campaignStartMs(campaign);
+  const matchedChannels =
+    getMatchedTrackedChannels(
+      campaign,
+      trackedChannels
+    );
+
+  /*
+   * We intentionally store campaigns even if they currently
+   * have no tracked-channel match.
+   *
+   * But we do NOT spam every tracked user by default.
+   */
+  const hasTrackedMatch =
+    matchedChannels.length > 0;
+
+  if (
+    !hasTrackedMatch &&
+    !ALERT_UNSCOPED_DROPS
+  ) {
+    /*
+     * Still remember discovery so the campaign isn't repeatedly
+     * treated as "new" if its association later changes.
+     */
+    const stateKey =
+      `drop_state:${campaignId}`;
+
+    const previous =
+      await getJson(
+        env,
+        stateKey
+      );
+
+    if (!previous) {
+      await putJson(
+        env,
+        stateKey,
+        {
+          campaignId,
+          firstSeenAt:
+            new Date(now)
+              .toISOString(),
+          firstSeenMs: now,
+          lastSeenAt:
+            new Date(now)
+              .toISOString(),
+          lastSeenMs: now,
+          createdAt:
+            campaign?.created_at ||
+            null,
+          startsAt:
+            campaign?.starts_at ||
+            null,
+          endsAt:
+            campaign?.ends_at ||
+            null,
+          name:
+            getCampaignName(
+              campaign
+            ),
+          matched: false
+        }
+      );
+    } else {
+      previous.lastSeenAt =
+        new Date(now)
+          .toISOString();
+
+      previous.lastSeenMs =
+        now;
+
+      await putJson(
+        env,
+        stateKey,
+        previous
+      );
+    }
+
+    return;
+  }
 
   const stateKey =
     `drop_state:${campaignId}`;
 
-  let state = await getJson(env, stateKey);
+  const previous =
+    await getJson(
+      env,
+      stateKey
+    );
 
-  /*
-   * First API sighting.
-   *
-   * This is the most important part of the whole system.
-   * We do NOT care whether the campaign has started yet.
-   */
-  if (!state) {
-    state = {
-      campaignId,
-      firstSeenAt: new Date(now).toISOString(),
-      firstSeenMs: now,
-      createdAt: campaign?.created_at || null,
-      startsAt: campaign?.starts_at || null,
-      endsAt: campaign?.ends_at || null,
-      name: getCampaignName(campaign)
-    };
+  const firstSeen =
+    !previous;
+
+  if (!previous) {
+    await putJson(
+      env,
+      stateKey,
+      {
+        campaignId,
+        firstSeenAt:
+          new Date(now)
+            .toISOString(),
+        firstSeenMs: now,
+        lastSeenAt:
+          new Date(now)
+            .toISOString(),
+        lastSeenMs: now,
+        createdAt:
+          campaign?.created_at ||
+          null,
+        startsAt:
+          campaign?.starts_at ||
+          null,
+        endsAt:
+          campaign?.ends_at ||
+          null,
+        name:
+          getCampaignName(
+            campaign
+          ),
+        matched: true,
+        matchedChannels:
+          matchedChannels.map(
+            channel =>
+              channel.slug
+          )
+      },
+      DROP_STATE_TTL
+    );
+  } else {
+    previous.lastSeenAt =
+      new Date(now)
+        .toISOString();
+
+    previous.lastSeenMs =
+      now;
+
+    previous.matched =
+      true;
+
+    previous.matchedChannels =
+      matchedChannels.map(
+        channel =>
+          channel.slug
+      );
 
     await putJson(
       env,
       stateKey,
-      state
+      previous,
+      DROP_STATE_TTL
+    );
+  }
+
+  const start =
+    getCampaignStartMs(
+      campaign
     );
 
-    const targets =
-      await getNotificationTargets(env, campaign);
+  const state =
+    getCampaignState(
+      campaign,
+      now
+    );
 
+  /*
+   * ----------------------------------------------------------
+   * FIRST API SIGHTING
+   * ----------------------------------------------------------
+   *
+   * This is the critical signal for your early-warning system.
+   */
+  if (firstSeen) {
     const remainingSeconds =
       start
-        ? Math.max(0, (start - now) / 1000)
+        ? Math.max(
+            0,
+            (start - now) / 1000
+          )
         : null;
 
-    await sendDropAlert({
-      env,
-      campaign,
-      stage: 'discovered',
-      mode: 'discovered',
-      targets,
-      remainingSeconds,
-      stats
-    });
+    /*
+     * If the campaign is already active, do not send both
+     * "detected" and "active" notifications.
+     */
+    if (state === 'active') {
+      await sendDropAlert({
+        env,
+        campaign,
+        stage: 'active',
+        mode: 'active',
+        matchedChannels,
+        remainingSeconds,
+        stats
+      });
+    } else {
+      await sendDropAlert({
+        env,
+        campaign,
+        stage: 'discovered',
+        mode: 'discovered',
+        matchedChannels,
+        remainingSeconds,
+        stats
+      });
+    }
 
     /*
-     * Measure how early the API exposed the campaign relative
-     * to its scheduled start.
+     * Record actual API lead time when starts_at exists.
      */
     if (start) {
       const leadSeconds =
-        (start - now) / 1000;
+        (start - now) /
+        1000;
 
       console.log(
-        `[DROP DISCOVERY] ${campaignId} "${getCampaignName(campaign)}" ` +
-        `lead=${formatDuration(leadSeconds)} ` +
-        `starts=${new Date(start).toISOString()}`
+        `[DROP DISCOVERY] ` +
+        `${campaignId} ` +
+        `"${getCampaignName(
+          campaign
+        )}" ` +
+        `state=${state} ` +
+        `apiLead=${formatDuration(
+          leadSeconds
+        )} ` +
+        `starts=${new Date(
+          start
+        ).toISOString()}`
+      );
+
+      await putJson(
+        env,
+        `${stateKey}:telemetry`,
+        {
+          firstSeenAt:
+            new Date(now)
+              .toISOString(),
+          startsAt:
+            campaign.starts_at ||
+            null,
+          leadSeconds
+        },
+        DROP_STATE_TTL
       );
     } else {
       console.log(
-        `[DROP DISCOVERY] ${campaignId} "${getCampaignName(campaign)}" ` +
-        `starts_at unavailable`
+        `[DROP DISCOVERY] ` +
+        `${campaignId} ` +
+        `"${getCampaignName(
+          campaign
+        )}" ` +
+        `starts_at=unavailable`
       );
     }
   }
 
   /*
+   * ----------------------------------------------------------
    * PRE-START ALERTS
+   * ----------------------------------------------------------
    */
-  if (start && now < start) {
+
+  if (
+    start &&
+    now < start
+  ) {
     const remainingSeconds =
-      (start - now) / 1000;
+      (start - now) /
+      1000;
 
-    const targets =
-      await getNotificationTargets(env, campaign);
-
-    for (const threshold of DROP_PREALERT_SECONDS) {
-      if (remainingSeconds <= threshold) {
+    for (
+      const threshold
+      of DROP_PREALERT_SECONDS
+    ) {
+      if (
+        remainingSeconds <=
+        threshold
+      ) {
         await sendDropAlert({
           env,
           campaign,
-          stage: `pre_${threshold}`,
+          stage:
+            `pre_${threshold}`,
           mode: 'prealert',
-          targets,
+          matchedChannels,
           remainingSeconds,
           stats
         });
@@ -804,86 +1388,96 @@ async function processCampaign(
   }
 
   /*
-   * ACTIVE ALERT
-   *
-   * This fires even if the campaign was first discovered
-   * only after the start time.
+   * ----------------------------------------------------------
+   * ACTIVE
+   * ----------------------------------------------------------
    */
-  if (isCampaignActive(campaign, now)) {
-    const targets =
-      await getNotificationTargets(env, campaign);
 
+  if (
+    isCampaignActive(
+      campaign,
+      now
+    )
+  ) {
     await sendDropAlert({
       env,
       campaign,
       stage: 'active',
       mode: 'active',
-      targets,
+      matchedChannels,
       stats
     });
   }
 }
 
 // ============================================================
-// GLOBAL DROP SCAN
+// DROP SCAN
 // ============================================================
 
-async function checkGlobalDrops(
+async function checkGlobalDrops({
   env,
   campaigns,
+  trackedChannels,
   stats
-) {
+}) {
   if (!campaigns.length) {
     return;
   }
 
   /*
-   * Process every currently returned campaign.
+   * Important:
    *
-   * IMPORTANT:
-   * We intentionally do NOT filter to active campaigns.
-   * This preserves future campaigns so we can warn before
-   * starts_at.
+   * We process EVERYTHING returned by the API.
+   *
+   * We do NOT filter only active campaigns.
+   *
+   * This is what preserves the possibility of getting
+   * seconds/minutes/hours of warning before starts_at.
    */
-  for (const campaign of campaigns) {
+  for (
+    const campaign
+    of campaigns
+  ) {
     try {
-      await processCampaign(
+      await processCampaign({
         env,
         campaign,
+        trackedChannels,
         stats
-      );
+      });
     } catch (error) {
       stats.errors++;
 
       console.error(
         'processCampaign failed:',
-        error?.message || error
+        error?.message ||
+          error
       );
     }
   }
 }
 
 // ============================================================
-// PER-CHANNEL DROP DETECTION
+// ACTIVE STREAM DROP CONFIRMATION
 // ============================================================
 
-async function detectChannelDrop(
+async function detectChannelDrop({
   env,
-  chatId,
   channel,
   livestream,
   campaigns,
   stats
-) {
+}) {
   if (!livestream) {
-    return {
-      matched: false
-    };
+    return false;
   }
 
-  for (const campaign of campaigns) {
+  for (
+    const campaign
+    of campaigns
+  ) {
     if (
-      !campaignInvolvesChannel(
+      !campaignMatchesTrackedChannel(
         campaign,
         channel
       )
@@ -892,109 +1486,167 @@ async function detectChannelDrop(
     }
 
     const campaignId =
-      getCampaignId(campaign);
+      getCampaignId(
+        campaign
+      );
 
     if (!campaignId) {
       continue;
     }
 
-    const now = nowMs();
+    const now =
+      nowMs();
 
-    /*
-     * Campaign engine handles early alerts globally.
-     *
-     * Here we make sure a streamer-specific chat also receives
-     * the active-drop signal when they are live.
-     */
-
-    if (!isCampaignActive(campaign, now)) {
+    if (
+      !isCampaignActive(
+        campaign,
+        now
+      )
+    ) {
       continue;
     }
 
-    const already =
+    const stage =
+      `channel_active:${normalizeSlug(
+        channel.slug
+      )}`;
+
+    if (
       await hasAlert(
         env,
         campaignId,
-        `channel_active:${channel.slug}`
-      );
-
-    if (already) {
+        stage
+      )
+    ) {
       continue;
     }
 
     const message =
-      buildDropMessage(
+      buildDropMessage({
         campaign,
-        'active',
-        null,
-        channel.slug
-      );
+        mode: 'active',
+        matchedChannels: [
+          channel
+        ]
+      });
 
     try {
       await tg.sendMessage(
         env.BOT_TOKEN,
-        chatId,
+        channel.notify_chat_id,
         message,
-        { parse_mode: 'HTML' }
+        {
+          parse_mode: 'HTML'
+        }
       );
 
       await markAlert(
         env,
         campaignId,
-        `channel_active:${channel.slug}`
+        stage
       );
 
       stats.drops++;
       stats.alerts++;
 
-      return {
-        matched: true,
-        alreadyAlerted: false
-      };
+      return true;
     } catch (error) {
       console.error(
-        `channel drop alert failed (${channel.slug}):`,
-        error?.message || error
+        `channel drop alert failed ` +
+        `(${channel.slug}):`,
+        error?.message ||
+          error
       );
 
-      return {
-        matched: true,
-        alreadyAlerted: false,
-        error: true
-      };
+      return false;
     }
   }
 
-  return {
-    matched: false
-  };
+  return false;
 }
 
 // ============================================================
-// STREAM FETCH
+// CHANNEL API
 // ============================================================
 
-async function fetchWithTimeout(
+async function fetchChannelInfo(
   slug,
   env,
-  ms
+  signal
 ) {
-  const timeoutPromise =
-    new Promise((_, reject) => {
-      setTimeout(
-        () => reject(
-          new Error(
-            `channel fetch timeout after ${ms}ms`
-          )
-        ),
-        ms
-      );
-    });
+  const url =
+    `https://kick.com/api/v2/channels/${encodeURIComponent(
+      slug
+    )}`;
 
-  return Promise.race([
-    fetchChannelInfo(slug, env),
-    timeoutPromise
-  ]);
+  const headers = {
+    'User-Agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    Accept: 'application/json',
+
+    ...(env.KICK_SESSION_TOKEN && {
+      Authorization:
+        `Bearer ${env.KICK_SESSION_TOKEN}`
+    })
+  };
+
+  const response =
+    await fetch(
+      url,
+      {
+        method: 'GET',
+        headers,
+        signal,
+        cf: {
+          cacheTtl: 0,
+          cacheEverything: false
+        }
+      }
+    );
+
+  if (!response.ok) {
+    throw new Error(
+      `Channel API HTTP ${response.status}`
+    );
+  }
+
+  return response.json();
+}
+
+async function fetchChannelWithTimeout(
+  slug,
+  env
+) {
+  const controller =
+    new AbortController();
+
+  const timer =
+    setTimeout(
+      () =>
+        controller.abort(),
+      CHANNEL_FETCH_TIMEOUT_MS
+    );
+
+  try {
+    return await fetchChannelInfo(
+      slug,
+      env,
+      controller.signal
+    );
+  } catch (error) {
+    if (
+      error?.name ===
+      'AbortError'
+    ) {
+      throw new Error(
+        `channel fetch timeout after ${CHANNEL_FETCH_TIMEOUT_MS}ms`
+      );
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // ============================================================
@@ -1006,7 +1658,9 @@ async function markFail(
   channel
 ) {
   const failCount =
-    (channel.fail_count || 0) + 1;
+    Number(
+      channel.fail_count || 0
+    ) + 1;
 
   await env.DB.prepare(
     `UPDATE kick_channels
@@ -1022,17 +1676,18 @@ async function markFail(
     .run();
 }
 
-function shouldSkipChannel(channel, now) {
+function shouldSkipChannel({
+  channel,
+  now,
+  relevantDropSet
+}) {
+  /*
+   * Never use normal "offline skip" to hide a repeatedly failing
+   * channel; failure backoff handles that separately.
+   */
   if (
-    !channel.last_is_live &&
-    channel.last_checked &&
-    now - channel.last_checked < OFFLINE_SKIP_MS
-  ) {
-    return true;
-  }
-
-  if (
-    channel.fail_count >= BACKOFF_THRESHOLD &&
+    channel.fail_count >=
+      BACKOFF_THRESHOLD &&
     channel.last_checked
   ) {
     const backoffMinutes =
@@ -1046,8 +1701,49 @@ function shouldSkipChannel(channel, now) {
       );
 
     if (
-      now - channel.last_checked <
-      backoffMinutes * 60000
+      now -
+        channel.last_checked <
+      backoffMinutes *
+        60 *
+        1000
+    ) {
+      return true;
+    }
+  }
+
+  /*
+   * Live channels should be checked every run.
+   */
+  if (
+    channel.last_is_live
+  ) {
+    return false;
+  }
+
+  /*
+   * Offline channel:
+   *
+   * 60 seconds if relevant to a campaign.
+   * 5 minutes otherwise.
+   */
+  if (
+    channel.last_checked
+  ) {
+    const relevant =
+      channelIsDropRelevant(
+        channel,
+        relevantDropSet
+      );
+
+    const interval =
+      relevant
+        ? OFFLINE_SKIP_SHORT_MS
+        : OFFLINE_SKIP_LONG_MS;
+
+    if (
+      now -
+        channel.last_checked <
+      interval
     ) {
       return true;
     }
@@ -1057,67 +1753,159 @@ function shouldSkipChannel(channel, now) {
 }
 
 // ============================================================
-// STREAM STATE PROCESSOR
+// CHANNEL PRIORITY
 // ============================================================
 
-async function processStateChange(
+function channelPriority({
+  channel,
+  relevantDropSet,
+  ownerSlug
+}) {
+  let score = 0;
+
+  const slug =
+    normalizeSlug(
+      channel.slug
+    );
+
+  /*
+   * Upcoming / active drop channel.
+   */
+  if (
+    channelIsDropRelevant(
+      channel,
+      relevantDropSet
+    )
+  ) {
+    score += 1000;
+  }
+
+  /*
+   * Currently live.
+   */
+  if (
+    channel.last_is_live
+  ) {
+    score += 500;
+  }
+
+  /*
+   * Owner.
+   */
+  if (
+    ownerSlug &&
+    slug ===
+      normalizeSlug(ownerSlug)
+  ) {
+    score += 250;
+  }
+
+  /*
+   * Older last_checked => more priority.
+   */
+  if (
+    channel.last_checked
+  ) {
+    const ageMinutes =
+      Math.min(
+        120,
+        Math.max(
+          0,
+          (
+            nowMs() -
+            channel.last_checked
+          ) /
+            60000
+        )
+      );
+
+    score += ageMinutes;
+  } else {
+    score += 150;
+  }
+
+  return score;
+}
+
+// ============================================================
+// STREAM STATE
+// ============================================================
+
+async function processStateChange({
   env,
   channel,
   isLive,
   livestream,
   campaigns,
   stats
-) {
-  const now = nowMs();
+}) {
+  const now =
+    nowMs();
 
   const title =
-    livestream?.session_title || '';
+    livestream?.session_title ||
+    '';
 
   const category =
-    livestream?.categories?.[0]?.name || '';
+    livestream?.categories?.[0]
+      ?.name ||
+    '';
 
   const viewers =
-    Number(livestream?.viewer_count || 0);
+    Number(
+      livestream?.viewer_count ||
+      0
+    );
 
-  // ==========================================================
+  const displayName =
+    channel.name ||
+    channel.slug;
+
+  // ----------------------------------------------------------
   // GOING LIVE
-  // ==========================================================
+  // ----------------------------------------------------------
 
-  if (isLive && !channel.last_is_live) {
+  if (
+    isLive &&
+    !channel.last_is_live
+  ) {
     try {
       await tg.sendMessage(
         env.BOT_TOKEN,
         channel.notify_chat_id,
         `🔴 <b>${escapeHtml(
-          channel.name || channel.slug
+          displayName
         )} LIVE!</b>\n` +
-        `📺 ${escapeHtml(title)}\n` +
+        `📺 ${escapeHtml(
+          title
+        )}\n` +
         `👁 ${viewers.toLocaleString()}\n` +
-        `👉 https://kick.com/${escapeHtml(channel.slug)}`,
-        { parse_mode: 'HTML' }
+        `👉 https://kick.com/${escapeHtml(
+          channel.slug
+        )}`,
+        {
+          parse_mode:
+            'HTML'
+        }
       );
 
       stats.alerts++;
     } catch (error) {
       console.error(
-        `live alert failed (${channel.slug}):`,
-        error?.message || error
+        `live alert failed ` +
+        `(${channel.slug}):`,
+        error?.message ||
+          error
       );
     }
 
-    await detectChannelDrop(
+    await detectChannelDrop({
       env,
-      channel.notify_chat_id,
-      {
-        slug: channel.slug,
-        name: channel.name,
-        broadcaster_user_id:
-          channel.broadcaster_user_id
-      },
+      channel,
       livestream,
       campaigns,
       stats
-    );
+    });
 
     await env.DB.prepare(
       `UPDATE kick_channels
@@ -1142,26 +1930,34 @@ async function processStateChange(
     return;
   }
 
-  // ==========================================================
+  // ----------------------------------------------------------
   // GOING OFFLINE
-  // ==========================================================
+  // ----------------------------------------------------------
 
-  if (!isLive && channel.last_is_live) {
+  if (
+    !isLive &&
+    channel.last_is_live
+  ) {
     try {
       await tg.sendMessage(
         env.BOT_TOKEN,
         channel.notify_chat_id,
         `⚫ <b>${escapeHtml(
-          channel.name || channel.slug
+          displayName
         )}</b> offline.`,
-        { parse_mode: 'HTML' }
+        {
+          parse_mode:
+            'HTML'
+        }
       );
 
       stats.alerts++;
     } catch (error) {
       console.error(
-        `offline alert failed (${channel.slug}):`,
-        error?.message || error
+        `offline alert failed ` +
+        `(${channel.slug}):`,
+        error?.message ||
+          error
       );
     }
 
@@ -1178,7 +1974,10 @@ async function processStateChange(
       )
       .run();
 
-    for (const milestone of VIEWER_MILESTONES) {
+    for (
+      const milestone
+      of VIEWER_MILESTONES
+    ) {
       await env.KV.delete(
         `milestone:${channel.slug}:${milestone}`
       );
@@ -1189,86 +1988,107 @@ async function processStateChange(
     return;
   }
 
-  // ==========================================================
+  // ----------------------------------------------------------
   // STAYING LIVE
-  // ==========================================================
+  // ----------------------------------------------------------
 
-  if (isLive && channel.last_is_live) {
-    // --------------------------
-    // Title changed
-    // --------------------------
-
+  if (
+    isLive &&
+    channel.last_is_live
+  ) {
+    // Title change
     if (
       title &&
-      title !== channel.last_title
+      title !==
+        channel.last_title
     ) {
       try {
         await tg.sendMessage(
           env.BOT_TOKEN,
           channel.notify_chat_id,
           `📝 <b>${escapeHtml(
-            channel.name || channel.slug
+            displayName
           )}</b> title changed:\n` +
-          `<i>${escapeHtml(title)}</i>`,
-          { parse_mode: 'HTML' }
+          `<i>${escapeHtml(
+            title
+          )}</i>`,
+          {
+            parse_mode:
+              'HTML'
+          }
         );
 
         stats.alerts++;
       } catch (error) {
         console.error(
-          `title alert failed (${channel.slug}):`,
-          error?.message || error
+          `title alert failed ` +
+          `(${channel.slug}):`,
+          error?.message ||
+            error
         );
       }
     }
 
-    // --------------------------
-    // Category changed
-    // --------------------------
-
+    // Category change
     if (
       category &&
-      category !== channel.last_category
+      category !==
+        channel.last_category
     ) {
       try {
         await tg.sendMessage(
           env.BOT_TOKEN,
           channel.notify_chat_id,
           `🏷 <b>${escapeHtml(
-            channel.name || channel.slug
-          )}</b> → ${escapeHtml(category)}`,
-          { parse_mode: 'HTML' }
+            displayName
+          )}</b> → ${escapeHtml(
+            category
+          )}`,
+          {
+            parse_mode:
+              'HTML'
+          }
         );
 
         stats.alerts++;
       } catch (error) {
         console.error(
-          `category alert failed (${channel.slug}):`,
-          error?.message || error
+          `category alert failed ` +
+          `(${channel.slug}):`,
+          error?.message ||
+            error
         );
       }
     }
 
-    // --------------------------
     // Viewer milestones
-    // --------------------------
+    const previousViewers =
+      Number(
+        channel.last_viewer_count ||
+        0
+      );
 
     if (
       viewers >
-      Number(channel.last_viewer_count || 0)
+      previousViewers
     ) {
-      for (const milestone of VIEWER_MILESTONES) {
-        const previous =
-          Number(channel.last_viewer_count || 0);
-
+      for (
+        const milestone
+        of VIEWER_MILESTONES
+      ) {
         if (
           viewers >= milestone &&
-          previous < milestone
+          previousViewers <
+            milestone
         ) {
           const key =
             `milestone:${channel.slug}:${milestone}`;
 
-          if (await env.KV.get(key)) {
+          if (
+            await env.KV.get(
+              key
+            )
+          ) {
             continue;
           }
 
@@ -1277,45 +2097,50 @@ async function processStateChange(
               env.BOT_TOKEN,
               channel.notify_chat_id,
               `🎉 <b>${escapeHtml(
-                channel.name || channel.slug
+                displayName
               )}</b> hit ${milestone.toLocaleString()} viewers!`,
-              { parse_mode: 'HTML' }
+              {
+                parse_mode:
+                  'HTML'
+              }
             );
 
             await env.KV.put(
               key,
               '1',
-              { expirationTtl: 21600 }
+              {
+                expirationTtl:
+                  21600
+              }
             );
 
             stats.alerts++;
           } catch (error) {
             console.error(
-              `milestone alert failed (${channel.slug}):`,
-              error?.message || error
+              `milestone alert failed ` +
+              `(${channel.slug}):`,
+              error?.message ||
+                error
             );
           }
         }
       }
     }
 
-    // --------------------------
-    // Drop check while LIVE
-    // --------------------------
-
-    await detectChannelDrop(
+    /*
+     * CRITICAL:
+     *
+     * Drop detection also happens during an existing stream.
+     * This catches drops that begin 10, 30, 60 minutes after
+     * the streamer went live.
+     */
+    await detectChannelDrop({
       env,
-      channel.notify_chat_id,
-      {
-        slug: channel.slug,
-        name: channel.name,
-        broadcaster_user_id:
-          channel.broadcaster_user_id
-      },
+      channel,
       livestream,
       campaigns,
       stats
-    );
+    });
 
     await env.DB.prepare(
       `UPDATE kick_channels
@@ -1339,9 +2164,9 @@ async function processStateChange(
     return;
   }
 
-  // ==========================================================
-  // OFFLINE & PREVIOUSLY OFFLINE
-  // ==========================================================
+  // ----------------------------------------------------------
+  // OFFLINE & WAS OFFLINE
+  // ----------------------------------------------------------
 
   await env.DB.prepare(
     `UPDATE kick_channels
@@ -1361,20 +2186,23 @@ async function processStateChange(
 // SINGLE CHANNEL CHECK
 // ============================================================
 
-async function checkSingleChannel(
+async function checkSingleChannel({
   env,
   channel,
   campaigns,
+  relevantDropSet,
   runId,
   stats
-) {
-  const now = nowMs();
+}) {
+  const now =
+    nowMs();
 
   if (
-    shouldSkipChannel(
+    shouldSkipChannel({
       channel,
-      now
-    )
+      now,
+      relevantDropSet
+    })
   ) {
     stats.skipped++;
     return;
@@ -1382,10 +2210,9 @@ async function checkSingleChannel(
 
   try {
     const info =
-      await fetchWithTimeout(
+      await fetchChannelWithTimeout(
         channel.slug,
-        env,
-        API_TIMEOUT_MS
+        env
       );
 
     if (!info) {
@@ -1395,36 +2222,48 @@ async function checkSingleChannel(
       );
 
       stats.errors++;
-
       return;
     }
 
-    if (channel.fail_count > 0) {
+    /*
+     * Successful request clears failure state.
+     */
+    if (
+      Number(
+        channel.fail_count ||
+        0
+      ) > 0
+    ) {
       await env.DB.prepare(
         `UPDATE kick_channels
          SET fail_count = 0
          WHERE id = ?`
       )
-        .bind(channel.id)
+        .bind(
+          channel.id
+        )
         .run();
     }
 
     const livestream =
-      info?.livestream || null;
+      info?.livestream ||
+      null;
 
     const isLive =
-      Boolean(livestream);
+      Boolean(
+        livestream
+      );
 
     stats.checked++;
 
-    await processStateChange(
+    await processStateChange({
       env,
       channel,
       isLive,
       livestream,
       campaigns,
       stats
-    );
+    });
   } catch (error) {
     await markFail(
       env,
@@ -1434,8 +2273,10 @@ async function checkSingleChannel(
     stats.errors++;
 
     console.error(
-      `[${runId}] channel ${channel.slug} failed:`,
-      error?.message || error
+      `[${runId}] ` +
+      `${channel.slug}:`,
+      error?.message ||
+        error
     );
   }
 }
@@ -1444,35 +2285,56 @@ async function checkSingleChannel(
 // STREAM SCANNER
 // ============================================================
 
-async function checkStreams(
+async function checkStreams({
   env,
   campaigns,
+  trackedChannels,
   runId,
   stats,
   runStart
-) {
-  const rows =
-    await env.DB.prepare(
-      `SELECT *
-       FROM kick_channels
-       WHERE active = 1
-       ORDER BY
-         CASE
-           WHEN last_is_live = 1 THEN 0
-           ELSE 1
-         END,
-         last_checked ASC`
-    ).all();
-
-  const channels =
-    rows.results || [];
-
-  if (!channels.length) {
+}) {
+  if (
+    !trackedChannels.length
+  ) {
     return;
   }
 
+  const relevantDropSet =
+    buildRelevantDropSet(
+      campaigns
+    );
+
+  const ownerSlug =
+    env.OWNER_KICK_SLUG ||
+    '';
+
+  /*
+   * Sort in memory so relevant channels are checked FIRST.
+   *
+   * Priority:
+   *   1. Campaign-related
+   *   2. Live
+   *   3. Owner
+   *   4. Oldest last_checked
+   */
+  const sorted =
+    [...trackedChannels]
+      .sort(
+        (a, b) =>
+          channelPriority({
+            channel: b,
+            relevantDropSet,
+            ownerSlug
+          }) -
+          channelPriority({
+            channel: a,
+            relevantDropSet,
+            ownerSlug
+          })
+      );
+
   const toCheck =
-    channels.slice(
+    sorted.slice(
       0,
       MAX_CHANNELS_PER_RUN
     );
@@ -1483,13 +2345,14 @@ async function checkStreams(
     i += MAX_CONCURRENT
   ) {
     if (
-      nowMs() - runStart >
-      CRON_BUDGET_MS
+      nowMs() - runStart >=
+      WORKER_BUDGET_MS
     ) {
       stats.skipped +=
-        toCheck.length -
-        stats.checked -
-        i;
+        Math.max(
+          0,
+          toCheck.length - i
+        );
 
       break;
     }
@@ -1501,14 +2364,16 @@ async function checkStreams(
       );
 
     await Promise.all(
-      batch.map(channel =>
-        checkSingleChannel(
-          env,
-          channel,
-          campaigns,
-          runId,
-          stats
-        )
+      batch.map(
+        channel =>
+          checkSingleChannel({
+            env,
+            channel,
+            campaigns,
+            relevantDropSet,
+            runId,
+            stats
+          })
       )
     );
   }
@@ -1523,70 +2388,118 @@ export async function runMonitor({
   executionCtx
 }) {
   const runId =
-    crypto.randomUUID().slice(0, 8);
+    crypto.randomUUID()
+      .slice(0, 8);
 
   const runStart =
     nowMs();
 
   const stats = {
+    campaigns: 0,
     checked: 0,
     live: 0,
     offline: 0,
     alerts: 0,
     drops: 0,
     errors: 0,
-    skipped: 0,
-    campaigns: 0
+    skipped: 0
   };
 
   try {
     /*
-     * CRITICAL:
+     * --------------------------------------------------------
+     * 1. Load tracked channels ONCE.
+     * --------------------------------------------------------
      *
-     * Fetch the drops endpoint EXACTLY ONCE.
-     *
-     * This is shared by both global drop discovery and
-     * per-channel live checks.
+     * This is the authoritative streamer list.
+     * Nothing here monitors random Kick streamers.
+     */
+    const rows =
+      await env.DB.prepare(
+        `SELECT *
+         FROM kick_channels
+         WHERE active = 1`
+      ).all();
+
+    const trackedChannels =
+      rows.results || [];
+
+    /*
+     * --------------------------------------------------------
+     * 2. Fetch Drops API ONCE.
+     * --------------------------------------------------------
      */
     const campaigns =
-      await fetchCampaigns(env);
-
-    stats.campaigns =
-      campaigns.length;
+      await fetchCampaigns(
+        env
+      );
 
     /*
-     * EARLY DROP ENGINE FIRST.
+     * If the API request failed, do not interpret an empty
+     * response as "there are no campaigns".
      *
-     * This happens before stream scanning so an API-visible
-     * drop gets priority.
+     * Still perform stream monitoring.
      */
-    await checkGlobalDrops(
-      env,
-      campaigns,
-      stats
-    );
+    if (campaigns === null) {
+      stats.errors++;
 
-    /*
-     * Normal stream monitoring.
-     */
-    await checkStreams(
-      env,
-      campaigns,
-      runId,
-      stats,
-      runStart
-    );
+      console.error(
+        `[${runId}] Drops API unavailable`
+      );
+
+      await checkStreams({
+        env,
+        campaigns: [],
+        trackedChannels,
+        runId,
+        stats,
+        runStart
+      });
+    } else {
+      stats.campaigns =
+        campaigns.length;
+
+      /*
+       * ------------------------------------------------------
+       * 3. Campaign engine FIRST.
+       * ------------------------------------------------------
+       *
+       * This gives drops maximum priority.
+       */
+      await checkGlobalDrops({
+        env,
+        campaigns,
+        trackedChannels,
+        stats
+      });
+
+      /*
+       * ------------------------------------------------------
+       * 4. Stream engine.
+       * ------------------------------------------------------
+       */
+      await checkStreams({
+        env,
+        campaigns,
+        trackedChannels,
+        runId,
+        stats,
+        runStart
+      });
+    }
   } catch (error) {
     stats.errors++;
 
     console.error(
       `[${runId}] monitor fatal error:`,
-      error?.message || error
+      error?.message ||
+        error
     );
   }
 
   const duration =
-    nowMs() - runStart;
+    nowMs() -
+    runStart;
 
   console.log(
     `[${runId}] done ` +
