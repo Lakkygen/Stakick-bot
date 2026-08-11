@@ -20,5 +20,10 @@ binding = "DB"
 database_name = "stakick-db"
 database_id = "735e166d-dc36-4a19-8fdb-f0b33ef41f90"
 
+[durable_objects]
+bindings = [
+  { name = "DROP_ALARM", class_name = "DropAlarm" }
+]
+
 [triggers]
 crons = ["* * * * *"]
