@@ -12,9 +12,7 @@ export async function handleKickEventSub(c) {
     case 'livestream.status.updated':
       if (data.is_live) {
         await tg.sendMessage(c.env.BOT_TOKEN, parseInt(defaultGroup),
-          `🔴 <b>${data.channel_slug}</b> went LIVE!
-📺 ${data.title}
-🔗 https://kick.com/${data.channel_slug}`,
+          `🔴 <b>${data.channel_slug}</b> went LIVE!\n📺 ${data.title}\n🔗 https://kick.com/${data.channel_slug}`,
           { parse_mode: 'HTML' });
       } else {
         await tg.sendMessage(c.env.BOT_TOKEN, parseInt(defaultGroup),
