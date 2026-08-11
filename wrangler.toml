@@ -9,7 +9,8 @@ OWNER_KICK_SLUG = "lakkygen"
 OWNER_ID = "6816397800"
 ENVIRONMENT = "production"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MODEL = "google/gemini-2.5-flash-preview:free"
+OPENROUTER_MODEL = "poolside/laguna-xs-2.1:free"
+BOT_TOKEN = "8897459739:AAFF6XZWwqSx4p1J5xeMMUhZiZHSx90p7BA"
 
 [[kv_namespaces]]
 binding = "KV"
