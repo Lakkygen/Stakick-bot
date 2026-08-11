@@ -14,6 +14,5 @@ export async function logCommand(c, next) {
       ).bind(user.id, chat.id, Date.now()).run()
     );
   }
-
   return next();
 }
