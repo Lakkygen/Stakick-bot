@@ -3,7 +3,7 @@ import { tg } from '../../telegram';
 export async function help(c, update, parsed) {
   const chatId = update.message.chat.id;
 
-  const text = `<b>📚 Stakick Command Reference</b>
+  const text = `📚 <b>Stakick Command Reference</b>
 
 <b>Group Commands (tag me + command):</b>
 <code>@StakickBot /ban</code> — Reply to user to ban
@@ -21,6 +21,7 @@ export async function help(c, update, parsed) {
 <code>/kickstatus xqc</code> — Check status now
 <code>/kickdrops</code> — Recent drop alerts
 <code>/kicksetnotify</code> — Set default group (admin)
+<code>/kickclips xqc</code> — Show recent clips
 
 <b>External Tools:</b>
 <code>/weather London</code>
