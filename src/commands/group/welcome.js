@@ -11,7 +11,7 @@ export async function handleNewMembers(c, update) {
     }
 
     const welcomeText = await c.env.KV.get(`welcome:${message.chat.id}`) ||
-      `👋 Welcome, <a href="tg://user?id=${member.id}">${member.first_name}</a>! Enjoy your stay.`;
+      `👋 Welcome, ${member.first_name}! Enjoy your stay.`;
 
     await tg.sendMessage(c.env.BOT_TOKEN, message.chat.id, welcomeText, { parse_mode: 'HTML' });
   }
@@ -53,8 +53,7 @@ export async function rules(c, update, parsed) {
   const row = await c.env.DB.prepare('SELECT rules FROM group_settings WHERE chat_id = ?')
     .bind(message.chat.id).first();
 
-  const text = row?.rules ? `📜 <b>Group Rules:</b>
-${row.rules}` : 'No rules set yet. Use /setrules';
+  const text = row?.rules ? `📜 <b>Group Rules:</b>\\n${row.rules}` : 'No rules set yet. Use /setrules';
   await tg.sendMessage(c.env.BOT_TOKEN, message.chat.id, text, { parse_mode: 'HTML' });
   return c.text('OK');
 }
