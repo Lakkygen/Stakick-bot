@@ -1,23 +1,18 @@
 import { Hono } from 'hono';
+import { DurableObject } from 'cloudflare:workers';
 
 import { tg } from './telegram';
 import { parseInput } from './parser';
 import { commandRegistry } from './config';
-import {
-  requireAdmin,
-  requireGroup,
-} from './middleware/auth';
+import { requireAdmin, requireGroup } from './middleware/auth';
 import { rateLimit } from './middleware/rateLimit';
 import { logCommand } from './middleware/logger';
 import { handleNewMembers } from './commands/group/welcome';
 import { checkReminders } from './commands/external/remind';
+import { runMonitor } from './kick/monitor';
 import { handleKickEventSub } from './kick/eventsub';
 import { queryAI } from './services/ai';
 import { ensureSchema } from './db';
-
-// IMPORTANT:
-// This must match src/kick/dropAlarm.js exactly.
-import { DropAlarm } from './kick/dropAlarm';
 
 const app = new Hono();
 
@@ -25,7 +20,8 @@ const app = new Hono();
 // CONFIG
 // ============================================================
 
-const MONITOR_ALARM_NAME = 'main-monitor';
+const MONITOR_INTERVAL_MS = 15_000;
+const MONITOR_ALARM_NAME = 'main';
 
 // ============================================================
 // HELPERS
@@ -63,7 +59,6 @@ async function whitelistCheck(c, update) {
   const text =
     update.message?.text || '';
 
-  // Owner private chat is always allowed.
   if (
     chatType === 'private' &&
     String(userId) === OWNER_ID
@@ -71,32 +66,35 @@ async function whitelistCheck(c, update) {
     return true;
   }
 
-  // Owner can approve chats before they are whitelisted.
   if (
     String(userId) === OWNER_ID &&
-    text.trim().toLowerCase().startsWith('/approve')
+    text
+      .trim()
+      .toLowerCase()
+      .startsWith('/approve')
   ) {
     return true;
   }
 
   const whitelistRaw =
-    await c.env.KV.get('bot_whitelist');
+    await c.env.KV.get(
+      'bot_whitelist'
+    );
 
-  let whitelist = [];
-
-  try {
-    whitelist = whitelistRaw
+  const whitelist =
+    whitelistRaw
       ? JSON.parse(whitelistRaw)
       : [];
-  } catch {
-    whitelist = [];
-  }
 
-  if (whitelist.includes(String(chatId))) {
+  if (
+    whitelist.includes(
+      String(chatId)
+    )
+  ) {
     return true;
   }
 
-  if (update.message && chatId != null) {
+  if (update.message) {
     await tg.sendMessage(
       c.env.BOT_TOKEN,
       chatId,
@@ -107,24 +105,88 @@ async function whitelistCheck(c, update) {
   return false;
 }
 
-async function handleOpenRouterAI(c, prompt) {
+async function handleOpenRouterAI(
+  c,
+  prompt
+) {
   try {
     const host =
       c.req.header('host') ||
       'stakick-bot.workers.dev';
 
-    const reply = await queryAI(
-      c.env,
-      prompt,
-      { host }
+    const reply =
+      await queryAI(
+        c.env,
+        prompt,
+        { host }
+      );
+
+    return (
+      reply ||
+      '❌ Empty AI response.'
     );
-
-    return reply || '❌ Empty AI response.';
   } catch (err) {
-    console.error('AI error:', err);
-
     return `❌ AI error: ${err.message}`;
   }
+}
+
+// ============================================================
+// DURABLE OBJECT ACCESS
+// ============================================================
+
+function getMonitorStub(env) {
+  if (!env.MONITOR_ALARM) {
+    throw new Error(
+      'MONITOR_ALARM Durable Object binding is missing.'
+    );
+  }
+
+  const id =
+    env.MONITOR_ALARM.idFromName(
+      MONITOR_ALARM_NAME
+    );
+
+  return env.MONITOR_ALARM.get(id);
+}
+
+async function callMonitorDO(
+  env,
+  path,
+  options = {}
+) {
+  const stub =
+    getMonitorStub(env);
+
+  const response =
+    await stub.fetch(
+      `https://monitor.internal${path}`,
+      {
+        method:
+          options.method || 'GET',
+        headers: {
+          'content-type':
+            'application/json'
+        },
+        body:
+          options.body || undefined
+      }
+    );
+
+  let payload = null;
+
+  try {
+    payload =
+      await response.json();
+  } catch {
+    payload = {
+      ok: response.ok
+    };
+  }
+
+  return {
+    response,
+    payload
+  };
 }
 
 // ============================================================
@@ -139,72 +201,26 @@ const middlewareMap = {
 };
 
 // ============================================================
-// DURABLE OBJECT ACCESS
-// ============================================================
-
-function getDropAlarmStub(env) {
-  if (!env.DROP_ALARM) {
-    throw new Error(
-      'DROP_ALARM Durable Object binding is missing.'
-    );
-  }
-
-  const id = env.DROP_ALARM.idFromName(
-    MONITOR_ALARM_NAME
-  );
-
-  return env.DROP_ALARM.get(id);
-}
-
-async function callDropAlarm(
-  env,
-  path,
-  method = 'GET'
-) {
-  const stub = getDropAlarmStub(env);
-
-  const response = await stub.fetch(
-    `https://drop-alarm.internal${path}`,
-    {
-      method,
-      headers: {
-        'content-type': 'application/json',
-      },
-    }
-  );
-
-  let payload = null;
-
-  try {
-    payload = await response.json();
-  } catch {
-    payload = {
-      ok: response.ok,
-    };
-  }
-
-  if (!response.ok) {
-    throw new Error(
-      payload?.error ||
-        `DropAlarm returned HTTP ${response.status}`
-    );
-  }
-
-  return payload;
-}
-
-// ============================================================
-// HOME
+// BASIC ROUTES
 // ============================================================
 
 app.get('/', (c) => {
   return c.json({
-    status: 'Stakick is alive',
-    owner: c.env.OWNER_KICK_SLUG || 'unknown',
-    service: 'stakick-bot',
-    version: '3.1.0',
-    monitor: 'durable-object-alarm',
-    timestamp: new Date().toISOString(),
+    status:
+      'Stakick is alive',
+    owner:
+      c.env.OWNER_KICK_SLUG ||
+      'unknown',
+    service:
+      'stakick-bot',
+    version:
+      '3.0.0',
+    monitor:
+      'durable-object-alarm',
+    monitor_interval_ms:
+      MONITOR_INTERVAL_MS,
+    timestamp:
+      new Date().toISOString(),
   });
 });
 
@@ -212,803 +228,880 @@ app.get('/', (c) => {
 // HEALTH
 // ============================================================
 
-app.get('/health', async (c) => {
-  let dbOk = false;
-  let kvOk = false;
+app.get(
+  '/health',
+  async (c) => {
+    let dbOk = false;
+    let kvOk = false;
 
-  const started = Date.now();
+    const start =
+      Date.now();
 
-  // ----------------------------
-  // D1
-  // ----------------------------
+    try {
+      await ensureSchema(
+        c.env
+      );
 
-  try {
-    await ensureSchema(c.env);
-
-    await c.env.DB
-      .prepare('SELECT 1')
-      .run();
-
-    dbOk = true;
-  } catch (error) {
-    console.error(
-      'Health DB check failed:',
-      error?.message || error
-    );
-  }
-
-  // ----------------------------
-  // KV
-  // ----------------------------
-
-  try {
-    const key = `health_check:${Date.now()}`;
-
-    await c.env.KV.put(
-      key,
-      'ok',
-      {
-        expirationTtl: 60,
-      }
-    );
-
-    const value =
-      await c.env.KV.get(key);
-
-    kvOk = value === 'ok';
-  } catch (error) {
-    console.error(
-      'Health KV check failed:',
-      error?.message || error
-    );
-  }
-
-  // ----------------------------
-  // Durable Object
-  // ----------------------------
-
-  let monitor = {
-    ok: false,
-    error: null,
-  };
-
-  try {
-    monitor = await callDropAlarm(
-      c.env,
-      '/status'
-    );
-  } catch (error) {
-    monitor = {
-      ok: false,
-      error:
-        error?.message ||
-        'DropAlarm unavailable',
-    };
-  }
-
-  const latencyMs =
-    Date.now() - started;
-
-  // ----------------------------
-  // Persistent health log
-  // ----------------------------
-
-  if (c.executionCtx?.waitUntil) {
-    c.executionCtx.waitUntil(
-      c.env.DB
+      await c.env.DB
         .prepare(
-          `INSERT INTO bot_health_log
-           (
-             check_type,
-             status,
-             details,
-             latency_ms,
-             created_at
-           )
-           VALUES (?, ?, ?, ?, ?)`
+          'SELECT 1'
         )
-        .bind(
-          'http_health',
-          dbOk &&
-          kvOk &&
-          Boolean(monitor?.ok)
-            ? 'ok'
-            : 'degraded',
-          `db=${dbOk},kv=${kvOk},monitor=${Boolean(
-            monitor?.ok
-          )}`,
-          latencyMs,
-          Date.now()
-        )
-        .run()
-        .catch(() => {})
-    );
-  }
+        .run();
 
-  return c.json({
-    ok:
-      dbOk &&
-      kvOk &&
-      Boolean(monitor?.ok),
+      dbOk = true;
+    } catch (e) {
+      console.error(
+        'Health DB check failed:',
+        e.message
+      );
+    }
 
-    db: dbOk,
-    kv: kvOk,
-    monitor,
+    try {
+      await c.env.KV.put(
+        'health_check',
+        Date.now().toString(),
+        {
+          expirationTtl: 60
+        }
+      );
 
-    latency_ms: latencyMs,
+      await c.env.KV.get(
+        'health_check'
+      );
 
-    service: 'stakick-bot',
-    version: '3.1.0',
-    timestamp: new Date().toISOString(),
-  });
-});
+      kvOk = true;
+    } catch (e) {
+      console.error(
+        'Health KV check failed:',
+        e.message
+      );
+    }
 
-// ============================================================
-// MANUAL MONITOR RUN
-// ============================================================
-//
-// Goes through the same Durable Object as the recurring alarm.
-// This prevents separate monitor execution paths.
-// ============================================================
+    let monitor = {
+      ok: false,
+      error: null
+    };
 
-app.get('/run', async (c) => {
-  if (
-    !isAuthorizedSecret(
-      c.env,
-      c.req.query('key')
-    )
-  ) {
-    return c.json(
-      {
+    try {
+      const result =
+        await callMonitorDO(
+          c.env,
+          '/status'
+        );
+
+      monitor =
+        result.payload;
+    } catch (e) {
+      monitor = {
         ok: false,
-        error:
-          'Unauthorized. Provide setup key.',
-      },
-      401
-    );
-  }
+        error: e.message
+      };
+    }
 
-  const started = Date.now();
+    const latencyMs =
+      Date.now() - start;
 
-  try {
-    const result = await callDropAlarm(
-      c.env,
-      '/run',
-      'POST'
-    );
+    if (
+      c.executionCtx?.waitUntil
+    ) {
+      c.executionCtx.waitUntil(
+        c.env.DB
+          .prepare(
+            `INSERT INTO bot_health_log
+             (
+               check_type,
+               status,
+               details,
+               latency_ms,
+               created_at
+             )
+             VALUES (?, ?, ?, ?, ?)`
+          )
+          .bind(
+            'http_health',
+            dbOk &&
+            kvOk &&
+            monitor.ok
+              ? 'ok'
+              : 'degraded',
+            `db=${dbOk}, kv=${kvOk}, monitor=${Boolean(
+              monitor.ok
+            )}`,
+            latencyMs,
+            Date.now()
+          )
+          .run()
+          .catch(() => {})
+      );
+    }
 
     return c.json({
-      ...result,
-      duration_ms:
-        Date.now() - started,
+      ok:
+        dbOk &&
+        kvOk &&
+        Boolean(monitor.ok),
+
+      db: dbOk,
+      kv: kvOk,
+      monitor,
+
+      latency_ms:
+        latencyMs,
+
+      service:
+        'stakick-bot',
+
+      version:
+        '3.0.0',
+
+      timestamp:
+        new Date().toISOString()
     });
-  } catch (error) {
-    console.error(
-      'Manual /run failed:',
-      error
+  }
+);
+
+// ============================================================
+// MANUAL MONITOR EXECUTION
+// ============================================================
+//
+// /run now goes through the Durable Object so manual runs and
+// alarm runs are serialized through the same stateful monitor.
+//
+// ============================================================
+
+app.get(
+  '/run',
+  async (c) => {
+    const setupSecret =
+      c.env.SETUP_SECRET;
+
+    if (
+      setupSecret &&
+      c.req.query('key') !==
+        setupSecret
+    ) {
+      return c.json(
+        {
+          ok: false,
+          error:
+            'Unauthorized. Provide setup key.'
+        },
+        401
+      );
+    }
+
+    console.log(
+      '🔥 Manual monitor run requested'
     );
 
-    return c.json(
-      {
-        ok: false,
-        error:
-          error?.message ||
-          'Monitor execution failed',
+    const start =
+      Date.now();
+
+    try {
+      const result =
+        await callMonitorDO(
+          c.env,
+          '/run',
+          {
+            method: 'POST'
+          }
+        );
+
+      return c.json({
+        ...result.payload,
         duration_ms:
-          Date.now() - started,
-      },
-      500
-    );
+          Date.now() -
+          start
+      });
+    } catch (err) {
+      console.error(
+        '❌ /run error:',
+        err
+      );
+
+      return c.json(
+        {
+          ok: false,
+          error:
+            err.message,
+          duration_ms:
+            Date.now() -
+            start
+        },
+        500
+      );
+    }
   }
-});
+);
 
 // ============================================================
 // MONITOR START
 // ============================================================
 
-app.get('/monitor/start', async (c) => {
-  if (
-    !isAuthorizedSecret(
-      c.env,
-      c.req.query('key')
-    )
-  ) {
-    return c.json(
-      {
-        ok: false,
-        error:
-          'Unauthorized. Provide setup key.',
-      },
-      401
-    );
+app.get(
+  '/monitor/start',
+  async (c) => {
+    if (
+      !isAuthorizedSecret(
+        c.env,
+        c.req.query('key')
+      )
+    ) {
+      return c.json(
+        {
+          ok: false,
+          error:
+            'Unauthorized. Provide setup key.'
+        },
+        401
+      );
+    }
+
+    try {
+      const result =
+        await callMonitorDO(
+          c.env,
+          '/start',
+          {
+            method: 'POST'
+          }
+        );
+
+      return c.json(
+        result.payload
+      );
+    } catch (error) {
+      console.error(
+        'Monitor start failed:',
+        error
+      );
+
+      return c.json(
+        {
+          ok: false,
+          error:
+            error.message
+        },
+        500
+      );
+    }
   }
-
-  try {
-    const result = await callDropAlarm(
-      c.env,
-      '/start',
-      'POST'
-    );
-
-    return c.json(result);
-  } catch (error) {
-    console.error(
-      'Monitor start failed:',
-      error
-    );
-
-    return c.json(
-      {
-        ok: false,
-        error:
-          error?.message ||
-          'Unable to start monitor',
-      },
-      500
-    );
-  }
-});
+);
 
 // ============================================================
 // MONITOR STOP
 // ============================================================
 
-app.get('/monitor/stop', async (c) => {
-  if (
-    !isAuthorizedSecret(
-      c.env,
-      c.req.query('key')
-    )
-  ) {
-    return c.json(
-      {
-        ok: false,
-        error:
-          'Unauthorized. Provide setup key.',
-      },
-      401
-    );
+app.get(
+  '/monitor/stop',
+  async (c) => {
+    if (
+      !isAuthorizedSecret(
+        c.env,
+        c.req.query('key')
+      )
+    ) {
+      return c.json(
+        {
+          ok: false,
+          error:
+            'Unauthorized. Provide setup key.'
+        },
+        401
+      );
+    }
+
+    try {
+      const result =
+        await callMonitorDO(
+          c.env,
+          '/stop',
+          {
+            method: 'POST'
+          }
+        );
+
+      return c.json(
+        result.payload
+      );
+    } catch (error) {
+      console.error(
+        'Monitor stop failed:',
+        error
+      );
+
+      return c.json(
+        {
+          ok: false,
+          error:
+            error.message
+        },
+        500
+      );
+    }
   }
-
-  try {
-    const result = await callDropAlarm(
-      c.env,
-      '/stop',
-      'POST'
-    );
-
-    return c.json(result);
-  } catch (error) {
-    console.error(
-      'Monitor stop failed:',
-      error
-    );
-
-    return c.json(
-      {
-        ok: false,
-        error:
-          error?.message ||
-          'Unable to stop monitor',
-      },
-      500
-    );
-  }
-});
+);
 
 // ============================================================
 // MONITOR STATUS
 // ============================================================
 
-app.get('/monitor/status', async (c) => {
-  if (
-    !isAuthorizedSecret(
-      c.env,
-      c.req.query('key')
-    )
-  ) {
-    return c.json(
-      {
-        ok: false,
-        error:
-          'Unauthorized. Provide setup key.',
-      },
-      401
-    );
-  }
-
-  try {
-    const result =
-      await callDropAlarm(
+app.get(
+  '/monitor/status',
+  async (c) => {
+    if (
+      !isAuthorizedSecret(
         c.env,
-        '/status'
+        c.req.query('key')
+      )
+    ) {
+      return c.json(
+        {
+          ok: false,
+          error:
+            'Unauthorized. Provide setup key.'
+        },
+        401
       );
+    }
 
-    return c.json(result);
-  } catch (error) {
-    return c.json(
-      {
-        ok: false,
-        error:
-          error?.message ||
-          'Unable to read monitor status',
-      },
-      500
-    );
+    try {
+      const result =
+        await callMonitorDO(
+          c.env,
+          '/status'
+        );
+
+      return c.json(
+        result.payload
+      );
+    } catch (error) {
+      return c.json(
+        {
+          ok: false,
+          error:
+            error.message
+        },
+        500
+      );
+    }
   }
-});
+);
 
 // ============================================================
 // TELEGRAM WEBHOOK
 // ============================================================
 
-app.post('/webhook', async (c) => {
-  const requestId =
-    crypto.randomUUID();
+app.post(
+  '/webhook',
+  async (c) => {
+    const requestId =
+      crypto.randomUUID();
 
-  try {
-    await ensureSchema(c.env);
+    try {
+      await ensureSchema(
+        c.env
+      );
 
-    const update =
-      await c.req.json();
+      const update =
+        await c.req.json();
 
-    c.set(
-      'update',
-      update
-    );
-
-    // ----------------------------
-    // Whitelist
-    // ----------------------------
-
-    const allowed =
-      await whitelistCheck(
-        c,
+      c.set(
+        'update',
         update
       );
 
-    if (!allowed) {
-      return c.text('OK');
-    }
-
-    // ----------------------------
-    // Cache bot username
-    // ----------------------------
-
-    const cachedUsername =
-      await c.env.KV.get(
-        'bot_username'
-      );
-
-    if (
-      !cachedUsername &&
-      update.message?.from?.is_bot &&
-      update.message?.from?.username
-    ) {
-      await c.env.KV.put(
-        'bot_username',
-        update.message.from.username
-      );
-    }
-
-    // ----------------------------
-    // Bot membership events
-    // ----------------------------
-
-    if (update.my_chat_member) {
-      const chat =
-        update.my_chat_member.chat;
-
-      const newStatus =
-        update.my_chat_member
-          .new_chat_member
-          ?.status;
-
-      if (
-        newStatus === 'member' ||
-        newStatus === 'administrator'
-      ) {
-        await c.env.DB
-          .prepare(
-            `INSERT INTO group_settings
-             (
-               chat_id,
-               welcome_msg,
-               updated_at
-             )
-             VALUES (?, ?, ?)
-             ON CONFLICT(chat_id)
-             DO NOTHING`
-          )
-          .bind(
-            chat.id,
-            null,
-            Date.now()
-          )
-          .run();
-
-        const existingDefault =
-          await c.env.KV.get(
-            'default_notify_group'
-          );
-
-        if (
-          !existingDefault &&
-          chat.type !== 'private'
-        ) {
-          await c.env.KV.put(
-            'default_notify_group',
-            String(chat.id)
-          );
-        }
-
-        // Ensure the high-frequency alarm is alive.
-        try {
-          await callDropAlarm(
-            c.env,
-            '/start',
-            'POST'
-          );
-        } catch (error) {
-          console.error(
-            'Unable to start DropAlarm after bot joined chat:',
-            error?.message ||
-              error
-          );
-        }
-      }
-
-      return c.text('OK');
-    }
-
-    // ----------------------------
-    // New members
-    // ----------------------------
-
-    if (
-      update.message?.new_chat_members
-    ) {
-      return await handleNewMembers(
-        c,
-        update
-      );
-    }
-
-    // ----------------------------
-    // Callback queries
-    // ----------------------------
-
-    if (update.callback_query) {
-      await tg.answerCallbackQuery(
-        c.env.BOT_TOKEN,
-        update.callback_query.id
-      );
-
-      const data =
-        update.callback_query.data;
-
-      const callbackMessage =
-        update.callback_query.message;
-
-      if (!callbackMessage) {
-        return c.text('OK');
-      }
-
-      const callbackMap = {
-        cmd_help: 'help',
-        cmd_weather: 'weather',
-        cmd_crypto: 'crypto',
-        cmd_ai: 'ask',
-        cmd_remind: 'remind',
-        cmd_kick: 'kickstatus',
-      };
-
-      const cmdName =
-        callbackMap[data];
-
-      if (
-        cmdName &&
-        commandRegistry[cmdName]
-      ) {
-        const [
-          handler,
-        ] =
-          commandRegistry[
-            cmdName
-          ];
-
-        await handler(
+      const allowed =
+        await whitelistCheck(
           c,
-          {
-            message:
-              callbackMessage,
-          },
-          {
-            args: '',
-          }
+          update
         );
 
-        return c.text('OK');
+      if (!allowed) {
+        return c.text(
+          'OK'
+        );
       }
 
-      if (data === 'menu_main') {
-        const startCmd =
-          commandRegistry.start;
+      const cachedUsername =
+        await c.env.KV.get(
+          'bot_username'
+        );
 
-        if (startCmd) {
-          await startCmd[0](
+      if (
+        !cachedUsername &&
+        update.message?.from?.is_bot &&
+        update.message?.from?.username
+      ) {
+        await c.env.KV.put(
+          'bot_username',
+          update.message.from.username
+        );
+      }
+
+      // --------------------------------------------------------
+      // BOT ADDED / REMOVED FROM CHAT
+      // --------------------------------------------------------
+
+      if (
+        update.my_chat_member
+      ) {
+        const chat =
+          update.my_chat_member
+            .chat;
+
+        const newStatus =
+          update.my_chat_member
+            .new_chat_member
+            ?.status;
+
+        if (
+          newStatus === 'member' ||
+          newStatus ===
+            'administrator'
+        ) {
+          await c.env.DB
+            .prepare(
+              `INSERT INTO group_settings
+               (
+                 chat_id,
+                 welcome_msg,
+                 updated_at
+               )
+               VALUES (?, ?, ?)
+               ON CONFLICT(chat_id)
+               DO NOTHING`
+            )
+            .bind(
+              chat.id,
+              null,
+              Date.now()
+            )
+            .run();
+
+          const existingDefault =
+            await c.env.KV.get(
+              'default_notify_group'
+            );
+
+          if (
+            !existingDefault &&
+            chat.type !==
+              'private'
+          ) {
+            await c.env.KV.put(
+              'default_notify_group',
+              String(chat.id)
+            );
+          }
+
+          /*
+           * Make sure the monitor is running once the bot is
+           * actually active.
+           */
+          try {
+            await callMonitorDO(
+              c.env,
+              '/start',
+              {
+                method:
+                  'POST'
+              }
+            );
+          } catch (error) {
+            console.error(
+              'Failed to start monitor:',
+              error
+            );
+          }
+        }
+
+        return c.text(
+          'OK'
+        );
+      }
+
+      // --------------------------------------------------------
+      // NEW MEMBERS
+      // --------------------------------------------------------
+
+      if (
+        update.message
+          ?.new_chat_members
+      ) {
+        return await handleNewMembers(
+          c,
+          update
+        );
+      }
+
+      // --------------------------------------------------------
+      // CALLBACKS
+      // --------------------------------------------------------
+
+      if (
+        update.callback_query
+      ) {
+        await tg.answerCallbackQuery(
+          c.env.BOT_TOKEN,
+          update.callback_query.id
+        );
+
+        const data =
+          update.callback_query
+            .data;
+
+        const callbackMessage =
+          update.callback_query
+            .message;
+
+        if (!callbackMessage) {
+          return c.text(
+            'OK'
+          );
+        }
+
+        const callbackMap = {
+          cmd_help:
+            'help',
+          cmd_weather:
+            'weather',
+          cmd_crypto:
+            'crypto',
+          cmd_ai:
+            'ask',
+          cmd_remind:
+            'remind',
+          cmd_kick:
+            'kickstatus'
+        };
+
+        const cmdName =
+          callbackMap[data];
+
+        if (
+          cmdName &&
+          commandRegistry[
+            cmdName
+          ]
+        ) {
+          const [
+            handler
+          ] =
+            commandRegistry[
+              cmdName
+            ];
+
+          await handler(
             c,
             {
               message:
-                callbackMessage,
+                callbackMessage
             },
             {
-              args: '',
+              args: ''
             }
           );
+
+          return c.text(
+            'OK'
+          );
         }
-
-        return c.text('OK');
-      }
-
-      return c.text('OK');
-    }
-
-    // ----------------------------
-    // Parse message
-    // ----------------------------
-
-    const botUsername =
-      cachedUsername ||
-      c.env.BOT_USERNAME ||
-      '';
-
-    const parsed =
-      parseInput(
-        update,
-        botUsername
-      );
-
-    if (!parsed) {
-      return c.text('OK');
-    }
-
-    c.set(
-      'parsed',
-      parsed
-    );
-
-    // ========================================================
-    // COMMANDS
-    // ========================================================
-
-    if (
-      parsed.type === 'command' &&
-      parsed.command
-    ) {
-      const cmdName =
-        parsed.command
-          .replace(/^\//, '')
-          .split('@')[0]
-          .toLowerCase();
-
-      // ------------------------------------------------------
-      // /approve
-      // ------------------------------------------------------
-
-      if (cmdName === 'approve') {
-        const userId =
-          String(
-            update.message?.from?.id
-          );
-
-        const chatId =
-          update.message?.chat?.id;
-
-        const OWNER_ID =
-          getOwnerId(
-            c.env
-          );
 
         if (
-          userId !== OWNER_ID
+          data ===
+          'menu_main'
         ) {
-          await tg.sendMessage(
-            c.env.BOT_TOKEN,
-            chatId,
-            '❌ Owner only.'
-          );
+          const startCmd =
+            commandRegistry
+              .start;
 
-          return c.text('OK');
+          if (startCmd) {
+            await startCmd[0](
+              c,
+              {
+                message:
+                  callbackMessage
+              },
+              {
+                args: ''
+              }
+            );
+          }
+
+          return c.text(
+            'OK'
+          );
         }
 
-        const targetId =
-          parsed.args?.trim() ||
-          String(chatId);
+        return c.text(
+          'OK'
+        );
+      }
 
-        const whitelistRaw =
-          await c.env.KV.get(
-            'bot_whitelist'
-          );
+      // --------------------------------------------------------
+      // PARSER
+      // --------------------------------------------------------
 
-        let whitelist = [];
+      const botUsername =
+        cachedUsername ||
+        c.env.BOT_USERNAME ||
+        '';
 
-        try {
-          whitelist =
+      const parsed =
+        parseInput(
+          update,
+          botUsername
+        );
+
+      if (!parsed) {
+        return c.text(
+          'OK'
+        );
+      }
+
+      c.set(
+        'parsed',
+        parsed
+      );
+
+      // --------------------------------------------------------
+      // COMMANDS
+      // --------------------------------------------------------
+
+      if (
+        parsed.type ===
+          'command' &&
+        parsed.command
+      ) {
+        const cmdName =
+          parsed.command
+            .replace(
+              /^\//,
+              ''
+            )
+            .split('@')[0]
+            .toLowerCase();
+
+        // ------------------
+        // /approve
+        // ------------------
+
+        if (
+          cmdName ===
+          'approve'
+        ) {
+          const userId =
+            String(
+              update.message
+                ?.from?.id
+            );
+
+          const chatId =
+            update.message
+              .chat.id;
+
+          const OWNER_ID =
+            getOwnerId(
+              c.env
+            );
+
+          if (
+            userId !==
+            OWNER_ID
+          ) {
+            await tg.sendMessage(
+              c.env.BOT_TOKEN,
+              chatId,
+              '❌ Owner only.'
+            );
+
+            return c.text(
+              'OK'
+            );
+          }
+
+          const targetId =
+            parsed.args
+              ?.trim() ||
+            String(chatId);
+
+          const whitelistRaw =
+            await c.env.KV.get(
+              'bot_whitelist'
+            );
+
+          const whitelist =
             whitelistRaw
               ? JSON.parse(
                   whitelistRaw
                 )
               : [];
-        } catch {
-          whitelist = [];
-        }
 
-        if (
-          !whitelist.includes(
-            targetId
-          )
-        ) {
-          whitelist.push(
-            targetId
-          );
-
-          await c.env.KV.put(
-            'bot_whitelist',
-            JSON.stringify(
-              whitelist
+          if (
+            !whitelist.includes(
+              targetId
             )
+          ) {
+            whitelist.push(
+              targetId
+            );
+
+            await c.env.KV.put(
+              'bot_whitelist',
+              JSON.stringify(
+                whitelist
+              )
+            );
+          }
+
+          await tg.sendMessage(
+            c.env.BOT_TOKEN,
+            chatId,
+            `✅ Group ${targetId} approved.`
+          );
+
+          return c.text(
+            'OK'
           );
         }
 
-        await tg.sendMessage(
-          c.env.BOT_TOKEN,
-          chatId,
-          `✅ Group ${targetId} approved.`
-        );
+        const entry =
+          commandRegistry[
+            cmdName
+          ];
 
-        // Ensure monitoring is running.
-        try {
-          await callDropAlarm(
-            c.env,
-            '/start',
-            'POST'
-          );
-        } catch (error) {
-          console.error(
-            'Unable to start DropAlarm after approval:',
-            error?.message ||
-              error
+        if (entry) {
+          const [
+            handler,
+            middlewares = [],
+            scope
+          ] = entry;
+
+          const chatType =
+            update.message
+              ?.chat?.type;
+
+          if (
+            scope === 'group' &&
+            chatType ===
+              'private'
+          ) {
+            await tg.sendMessage(
+              c.env.BOT_TOKEN,
+              update.message
+                .chat.id,
+              'Use this command in a group!'
+            );
+
+            return c.text(
+              'OK'
+            );
+          }
+
+          for (
+            const mwName
+            of middlewares
+          ) {
+            const middleware =
+              middlewareMap[
+                mwName
+              ];
+
+            if (!middleware) {
+              continue;
+            }
+
+            let nextCalled =
+              false;
+
+            const result =
+              await middleware(
+                c,
+                () => {
+                  nextCalled =
+                    true;
+                }
+              );
+
+            if (
+              !nextCalled
+            ) {
+              return (
+                result ||
+                c.text('OK')
+              );
+            }
+          }
+
+          return await handler(
+            c,
+            update,
+            parsed
           );
         }
-
-        return c.text('OK');
       }
 
-      // ------------------------------------------------------
-      // Registered commands
-      // ------------------------------------------------------
+      // --------------------------------------------------------
+      // NATURAL AI
+      // --------------------------------------------------------
 
-      const entry =
-        commandRegistry[
-          cmdName
-        ];
-
-      if (entry) {
-        const [
-          handler,
-          middlewares = [],
-          scope,
-        ] = entry;
-
-        const chatType =
-          update.message
-            ?.chat?.type;
+      if (
+        parsed.type ===
+          'natural' &&
+        parsed.isMention
+      ) {
+        const reply =
+          await handleOpenRouterAI(
+            c,
+            parsed.args ||
+              parsed.text ||
+              ''
+          );
 
         if (
-          scope === 'group' &&
-          chatType === 'private'
+          update.message
+            ?.chat?.id
         ) {
           await tg.sendMessage(
             c.env.BOT_TOKEN,
-            update.message.chat.id,
-            'Use this command in a group!'
+            update.message
+              .chat.id,
+            reply,
+            {
+              parse_mode:
+                'HTML'
+            }
           );
-
-          return c.text('OK');
         }
 
-        for (
-          const mwName
-          of middlewares
-        ) {
-          const middleware =
-            middlewareMap[
-              mwName
-            ];
-
-          if (!middleware) {
-            continue;
-          }
-
-          let nextCalled =
-            false;
-
-          const result =
-            await middleware(
-              c,
-              () => {
-                nextCalled = true;
-              }
-            );
-
-          if (!nextCalled) {
-            return (
-              result ||
-              c.text('OK')
-            );
-          }
-        }
-
-        return await handler(
-          c,
-          update,
-          parsed
-        );
-      }
-    }
-
-    // ========================================================
-    // NATURAL LANGUAGE AI
-    // ========================================================
-
-    if (
-      parsed.type === 'natural' &&
-      parsed.isMention
-    ) {
-      const reply =
-        await handleOpenRouterAI(
-          c,
-          parsed.args ||
-            parsed.text ||
-            ''
-        );
-
-      if (
-        update.message?.chat?.id
-      ) {
-        await tg.sendMessage(
-          c.env.BOT_TOKEN,
-          update.message.chat.id,
-          reply,
-          {
-            parse_mode: 'HTML',
-          }
+        return c.text(
+          'OK'
         );
       }
 
-      return c.text('OK');
+      return c.text(
+        'OK'
+      );
+    } catch (error) {
+      console.error(
+        `[${requestId}] Webhook error:`,
+        error
+      );
+
+      return c.json(
+        {
+          ok: false,
+          error:
+            'Webhook processing failed',
+          request_id:
+            requestId
+        },
+        500
+      );
     }
-
-    return c.text('OK');
-  } catch (error) {
-    console.error(
-      `[${requestId}] Webhook error:`,
-      error
-    );
-
-    return c.json(
-      {
-        ok: false,
-        error:
-          'Webhook processing failed',
-        request_id:
-          requestId,
-      },
-      500
-    );
   }
-});
+);
 
 // ============================================================
 // KICK EVENTSUB
@@ -1031,7 +1124,7 @@ app.post(
         {
           ok: false,
           error:
-            'Kick EventSub processing failed',
+            'Kick EventSub processing failed'
         },
         500
       );
@@ -1040,7 +1133,7 @@ app.post(
 );
 
 // ============================================================
-// KICK OAUTH CALLBACK
+// KICK OAUTH
 // ============================================================
 
 app.get(
@@ -1048,12 +1141,19 @@ app.get(
   async (c) => {
     try {
       const code =
-        c.req.query('code');
+        c.req.query(
+          'code'
+        );
 
       const state =
-        c.req.query('state');
+        c.req.query(
+          'state'
+        );
 
-      if (!code || !state) {
+      if (
+        !code ||
+        !state
+      ) {
         return c.text(
           'Missing OAuth parameters.',
           400
@@ -1073,14 +1173,9 @@ app.get(
       }
 
       const host =
-        c.req.header('host');
-
-      if (!host) {
-        return c.text(
-          'Unable to determine Worker hostname.',
-          500
+        c.req.header(
+          'host'
         );
-      }
 
       const redirectUri =
         `https://${host}/kick/oauth/callback`;
@@ -1089,38 +1184,51 @@ app.get(
         await fetch(
           'https://id.kick.com/oauth/token',
           {
-            method: 'POST',
+            method:
+              'POST',
+
             headers: {
               'Content-Type':
-                'application/json',
+                'application/json'
             },
-            body: JSON.stringify({
-              grant_type:
-                'authorization_code',
-              client_id:
-                c.env.KICK_CLIENT_ID,
-              client_secret:
-                c.env.KICK_CLIENT_SECRET,
-              code,
-              redirect_uri:
-                redirectUri,
-            }),
+
+            body:
+              JSON.stringify({
+                grant_type:
+                  'authorization_code',
+
+                client_id:
+                  c.env.KICK_CLIENT_ID,
+
+                client_secret:
+                  c.env.KICK_CLIENT_SECRET,
+
+                code,
+
+                redirect_uri:
+                  redirectUri
+              })
           }
         );
 
       const data =
         await response.json();
 
-      if (data.access_token) {
+      if (
+        data.access_token
+      ) {
         await c.env.KV.put(
           'kick_user_token',
           data.access_token,
           {
-            expirationTtl: 3500,
+            expirationTtl:
+              3500
           }
         );
 
-        if (data.refresh_token) {
+        if (
+          data.refresh_token
+        ) {
           await c.env.KV.put(
             'kick_refresh_token_backup',
             data.refresh_token
@@ -1169,16 +1277,12 @@ app.get(
   '/setup',
   async (c) => {
     try {
-      // ----------------------
-      // Basic bindings
-      // ----------------------
-
       if (!c.env.BOT_TOKEN) {
         return c.json(
           {
             ok: false,
             error:
-              'BOT_TOKEN is not configured as a Worker secret.',
+              'BOT_TOKEN is not configured as a Worker secret.'
           },
           500
         );
@@ -1189,79 +1293,45 @@ app.get(
           {
             ok: false,
             error:
-              'KV binding is missing from the Worker.',
+              'KV binding is missing from the Worker.'
           },
           500
         );
       }
 
-      if (!c.env.DB) {
-        return c.json(
-          {
-            ok: false,
-            error:
-              'DB binding is missing from the Worker.',
-          },
-          500
-        );
-      }
-
-      if (!c.env.DROP_ALARM) {
-        return c.json(
-          {
-            ok: false,
-            error:
-              'DROP_ALARM Durable Object binding is missing from the Worker.',
-          },
-          500
-        );
-      }
-
-      // ----------------------
-      // Setup authorization
-      // ----------------------
+      const setupSecret =
+        c.env.SETUP_SECRET;
 
       if (
-        !isAuthorizedSecret(
-          c.env,
-          c.req.query('key')
-        )
+        setupSecret &&
+        c.req.query('key') !==
+          setupSecret
       ) {
         return c.json(
           {
             ok: false,
             error:
-              'Unauthorized. Provide the setup key.',
+              'Unauthorized. Provide the setup key.'
           },
           401
         );
       }
 
       const host =
-        c.req.header('host');
+        c.req.header(
+          'host'
+        );
 
       if (!host) {
         return c.json(
           {
             ok: false,
             error:
-              'Unable to determine Worker hostname.',
+              'Unable to determine Worker hostname.'
           },
           500
         );
       }
-
-      // ----------------------
-      // Database schema
-      // ----------------------
-
-      await ensureSchema(
-        c.env
-      );
-
-      // ----------------------
-      // Telegram webhook
-      // ----------------------
 
       const webhookUrl =
         `https://${host}/webhook`;
@@ -1270,31 +1340,33 @@ app.get(
         await fetch(
           `https://api.telegram.org/bot${c.env.BOT_TOKEN}/setWebhook`,
           {
-            method: 'POST',
+            method:
+              'POST',
+
             headers: {
               'Content-Type':
-                'application/json',
+                'application/json'
             },
-            body: JSON.stringify({
-              url: webhookUrl,
-              allowed_updates: [
-                'message',
-                'callback_query',
-                'chat_member',
-                'my_chat_member',
-              ],
-              drop_pending_updates:
-                true,
-            }),
+
+            body:
+              JSON.stringify({
+                url: webhookUrl,
+
+                allowed_updates: [
+                  'message',
+                  'callback_query',
+                  'chat_member',
+                  'my_chat_member'
+                ],
+
+                drop_pending_updates:
+                  true
+              })
           }
         );
 
       const setWebhookData =
         await setWebhookResponse.json();
-
-      // ----------------------
-      // Telegram bot identity
-      // ----------------------
 
       const meResponse =
         await fetch(
@@ -1314,10 +1386,6 @@ app.get(
         );
       }
 
-      // ----------------------
-      // Telegram webhook status
-      // ----------------------
-
       const webhookResponse =
         await fetch(
           `https://api.telegram.org/bot${c.env.BOT_TOKEN}/getWebhookInfo`
@@ -1326,30 +1394,28 @@ app.get(
       const webhookData =
         await webhookResponse.json();
 
-      // ----------------------
-      // Start DropAlarm
-      // ----------------------
-
-      let monitorStart = null;
+      // Start the monitor alarm.
+      let monitorStart =
+        null;
 
       try {
-        monitorStart =
-          await callDropAlarm(
+        const result =
+          await callMonitorDO(
             c.env,
             '/start',
-            'POST'
+            {
+              method:
+                'POST'
+            }
           );
-      } catch (error) {
-        console.error(
-          'DropAlarm start during setup failed:',
-          error
-        );
 
+        monitorStart =
+          result.payload;
+      } catch (error) {
         monitorStart = {
           ok: false,
           error:
-            error?.message ||
-            'Unable to start DropAlarm',
+            error.message
         };
       }
 
@@ -1360,47 +1426,51 @@ app.get(
           ) &&
           Boolean(
             meData?.ok
-          ) &&
-          Boolean(
-            c.env.DROP_ALARM
           ),
 
         service:
           'stakick-bot',
 
         version:
-          '3.1.0',
+          '3.0.0',
 
         webhook: {
-          url: webhookUrl,
+          url:
+            webhookUrl,
+
           registration:
             setWebhookData,
+
           status:
-            webhookData,
+            webhookData
         },
 
-        bot: meData?.ok
-          ? {
-              id:
-                meData.result.id,
-              username:
-                meData.result.username,
-              first_name:
-                meData.result.first_name,
-              is_bot:
-                meData.result.is_bot,
-            }
-          : {
-              error:
-                meData?.description ||
-                'Unable to retrieve bot information.',
-            },
+        bot:
+          meData?.ok
+            ? {
+                id:
+                  meData.result.id,
+
+                username:
+                  meData.result.username,
+
+                first_name:
+                  meData.result.first_name,
+
+                is_bot:
+                  meData.result.is_bot
+              }
+            : {
+                error:
+                  meData?.description ||
+                  'Unable to retrieve bot information.'
+              },
 
         monitor:
           monitorStart,
 
         timestamp:
-          new Date().toISOString(),
+          new Date().toISOString()
       });
     } catch (error) {
       console.error(
@@ -1416,7 +1486,7 @@ app.get(
           message:
             error instanceof Error
               ? error.message
-              : 'Unknown error',
+              : 'Unknown error'
         },
         500
       );
@@ -1425,58 +1495,312 @@ app.get(
 );
 
 // ============================================================
-// NOT FOUND
+// FALLBACKS
 // ============================================================
 
-app.notFound((c) => {
-  return c.json(
-    {
-      ok: false,
-      error: 'Route not found',
-      path:
-        new URL(
-          c.req.url
-        ).pathname,
-      method: c.req.method,
-      service:
-        'stakick-bot',
-    },
-    404
-  );
-});
+app.notFound(
+  (c) => {
+    return c.json(
+      {
+        ok: false,
+        error:
+          'Route not found',
+        path:
+          new URL(
+            c.req.url
+          ).pathname,
+        method:
+          c.req.method,
+        service:
+          'stakick-bot'
+      },
+      404
+    );
+  }
+);
+
+app.onError(
+  (error, c) => {
+    console.error(
+      'Unhandled Worker error:',
+      error
+    );
+
+    return c.json(
+      {
+        ok: false,
+        error:
+          'Internal server error'
+      },
+      500
+    );
+  }
+);
 
 // ============================================================
-// GLOBAL ERROR HANDLER
-// ============================================================
-
-app.onError((error, c) => {
-  console.error(
-    'Unhandled Worker error:',
-    error
-  );
-
-  return c.json(
-    {
-      ok: false,
-      error:
-        'Internal server error',
-    },
-    500
-  );
-});
-
-// ============================================================
-// DURABLE OBJECT EXPORT
+// DURABLE OBJECT
 // ============================================================
 //
-// CRITICAL FOR WRANGLER:
+// One named Durable Object instance controls the monitor.
 //
-// Cloudflare already has a provisioned DropAlarm namespace.
-// Therefore the Worker MUST export the DropAlarm class.
-// This fixes the exact reconciliation error from deployment #78.
+// It:
+//   - keeps one alarm
+//   - runs runMonitor()
+//   - schedules itself again
+//   - serializes manual /run and alarm execution
+//
 // ============================================================
 
-export { DropAlarm };
+export class MonitorAlarm extends DurableObject {
+  constructor(ctx, env) {
+    super(
+      ctx,
+      env
+    );
+
+    this.env =
+      env;
+  }
+
+  async scheduleNextAlarm() {
+    const existing =
+      await this.ctx.storage.getAlarm();
+
+    if (
+      existing != null
+    ) {
+      return existing;
+    }
+
+    const next =
+      Date.now() +
+      MONITOR_INTERVAL_MS;
+
+    await this.ctx.storage.setAlarm(
+      next
+    );
+
+    return next;
+  }
+
+  async alarm(alarmInfo) {
+    const started =
+      Date.now();
+
+    let result =
+      null;
+
+    try {
+      console.log(
+        `[MONITOR ALARM] fired ` +
+        `retry=${alarmInfo?.retryCount || 0}`
+      );
+
+      result =
+        await runMonitor({
+          env: this.env,
+          executionCtx: null
+        });
+
+      console.log(
+        `[MONITOR ALARM] completed ` +
+        `${Date.now() - started}ms`
+      );
+    } catch (error) {
+      /*
+       * Don't allow one failure to permanently kill the recurring
+       * monitor. Cloudflare retries failed alarms automatically,
+       * but we also explicitly schedule the next run.
+       */
+      console.error(
+        '[MONITOR ALARM] monitor failed:',
+        error
+      );
+    } finally {
+      /*
+       * A Durable Object has one alarm at a time.
+       * Schedule the next one after this execution finishes.
+       */
+      try {
+        await this.ctx.storage.setAlarm(
+          Date.now() +
+            MONITOR_INTERVAL_MS
+        );
+      } catch (scheduleError) {
+        console.error(
+          '[MONITOR ALARM] failed to reschedule:',
+          scheduleError
+        );
+      }
+    }
+
+    return result;
+  }
+
+  async fetch(request) {
+    const url =
+      new URL(
+        request.url
+      );
+
+    // ----------------------------------------------------------
+    // STATUS
+    // ----------------------------------------------------------
+
+    if (
+      url.pathname ===
+      '/status'
+    ) {
+      const alarm =
+        await this.ctx.storage.getAlarm();
+
+      return Response.json({
+        ok: true,
+
+        running:
+          alarm != null,
+
+        alarm_at:
+          alarm,
+
+        alarm_in_ms:
+          alarm != null
+            ? Math.max(
+                0,
+                alarm -
+                  Date.now()
+              )
+            : null,
+
+        interval_ms:
+          MONITOR_INTERVAL_MS,
+
+        interval_seconds:
+          MONITOR_INTERVAL_MS /
+          1000
+      });
+    }
+
+    // ----------------------------------------------------------
+    // START
+    // ----------------------------------------------------------
+
+    if (
+      url.pathname ===
+      '/start'
+    ) {
+      const existing =
+        await this.ctx.storage.getAlarm();
+
+      if (
+        existing == null
+      ) {
+        const next =
+          Date.now() +
+          1000;
+
+        await this.ctx.storage.setAlarm(
+          next
+        );
+
+        return Response.json({
+          ok: true,
+          started: true,
+          first_alarm_at:
+            next,
+          interval_ms:
+            MONITOR_INTERVAL_MS
+        });
+      }
+
+      return Response.json({
+        ok: true,
+        started: false,
+        already_running:
+          true,
+        alarm_at:
+          existing,
+        alarm_in_ms:
+          Math.max(
+            0,
+            existing -
+              Date.now()
+          ),
+        interval_ms:
+          MONITOR_INTERVAL_MS
+      });
+    }
+
+    // ----------------------------------------------------------
+    // STOP
+    // ----------------------------------------------------------
+
+    if (
+      url.pathname ===
+      '/stop'
+    ) {
+      await this.ctx.storage.deleteAlarm();
+
+      return Response.json({
+        ok: true,
+        stopped: true
+      });
+    }
+
+    // ----------------------------------------------------------
+    // MANUAL RUN
+    // ----------------------------------------------------------
+
+    if (
+      url.pathname ===
+      '/run'
+    ) {
+      const started =
+        Date.now();
+
+      let stats =
+        null;
+
+      try {
+        stats =
+          await runMonitor({
+            env: this.env,
+            executionCtx:
+              null
+          });
+      } finally {
+        /*
+         * Make sure the recurring monitor continues after
+         * a manual run.
+         */
+        await this.ctx.storage.setAlarm(
+          Date.now() +
+            MONITOR_INTERVAL_MS
+        );
+      }
+
+      return Response.json({
+        ok: true,
+        manual: true,
+        duration_ms:
+          Date.now() -
+          started,
+        stats
+      });
+    }
+
+    return Response.json(
+      {
+        ok: false,
+        error:
+          'Unknown monitor operation'
+      },
+      {
+        status: 404
+      }
+    );
+  }
+}
 
 // ============================================================
 // WORKER ENTRYPOINT
@@ -1495,55 +1819,49 @@ export default {
     );
   },
 
-  // ==========================================================
-  // CRON WATCHDOG
-  // ==========================================================
-  //
-  // Native Cloudflare Cron runs once per minute.
-  //
-  // It does NOT execute runMonitor directly.
-  //
-  // It simply ensures the persistent Durable Object alarm
-  // is alive.
-  //
-  // The DropAlarm object is responsible for the recurring
-  // high-frequency monitor loop.
-  // ==========================================================
-
   async scheduled(
     controller,
     env,
     ctx
   ) {
+    /*
+     * Native Cron is now the WATCHDOG.
+     *
+     * It does NOT directly execute runMonitor().
+     * It merely makes sure the Durable Object alarm is alive.
+     *
+     * This prevents duplicate monitor executions.
+     */
+
     ctx.waitUntil(
       (async () => {
         try {
-          await callDropAlarm(
+          await callMonitorDO(
             env,
             '/start',
-            'POST'
-          );
-
-          console.log(
-            '[CRON] DropAlarm watchdog OK'
+            {
+              method:
+                'POST'
+            }
           );
         } catch (error) {
           console.error(
-            '[CRON] DropAlarm watchdog failed:',
-            error?.message ||
-              error
+            'Monitor watchdog failed:',
+            error
           );
         }
       })()
     );
 
-    // Reminders remain on the regular Cron schedule.
+    /*
+     * Reminders remain on the normal Cron path.
+     */
     ctx.waitUntil(
       checkReminders({
         env,
         executionCtx:
-          ctx,
+          ctx
       })
     );
-  },
+  }
 };
