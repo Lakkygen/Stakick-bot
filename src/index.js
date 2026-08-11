@@ -1,18 +1,26 @@
 import { Hono } from 'hono';
-import { DurableObject } from 'cloudflare:workers';
 
 import { tg } from './telegram';
 import { parseInput } from './parser';
 import { commandRegistry } from './config';
-import { requireAdmin, requireGroup } from './middleware/auth';
+import {
+  requireAdmin,
+  requireGroup
+} from './middleware/auth';
 import { rateLimit } from './middleware/rateLimit';
 import { logCommand } from './middleware/logger';
-import { handleNewMembers } from './commands/group/welcome';
-import { checkReminders } from './commands/external/remind';
-import { runMonitor } from './kick/monitor';
+import {
+  handleNewMembers
+} from './commands/group/welcome';
+import {
+  checkReminders
+} from './commands/external/remind';
 import { handleKickEventSub } from './kick/eventsub';
 import { queryAI } from './services/ai';
 import { ensureSchema } from './db';
+
+// Premium monitor alarm Durable Object.
+import { DropAlarm } from './kick/dropAlarm';
 
 const app = new Hono();
 
@@ -20,29 +28,40 @@ const app = new Hono();
 // CONFIG
 // ============================================================
 
-const MONITOR_INTERVAL_MS = 15_000;
-const MONITOR_ALARM_NAME = 'main';
+const MONITOR_ALARM_NAME = 'main-monitor';
 
 // ============================================================
 // HELPERS
 // ============================================================
 
 function getOwnerId(env) {
-  return String(env.OWNER_ID || '6816397800');
+  return String(
+    env.OWNER_ID || '6816397800'
+  );
 }
 
-function isAuthorizedSecret(env, provided) {
-  const configured = env.SETUP_SECRET;
+function isAuthorizedSecret(
+  env,
+  provided
+) {
+  const configured =
+    env.SETUP_SECRET;
 
   if (!configured) {
     return true;
   }
 
-  return provided === configured;
+  return (
+    provided === configured
+  );
 }
 
-async function whitelistCheck(c, update) {
-  const OWNER_ID = getOwnerId(c.env);
+async function whitelistCheck(
+  c,
+  update
+) {
+  const OWNER_ID =
+    getOwnerId(c.env);
 
   const chatId =
     update.message?.chat?.id ||
@@ -59,6 +78,7 @@ async function whitelistCheck(c, update) {
   const text =
     update.message?.text || '';
 
+  // Owner's private chat.
   if (
     chatType === 'private' &&
     String(userId) === OWNER_ID
@@ -66,6 +86,8 @@ async function whitelistCheck(c, update) {
     return true;
   }
 
+  // Owner may issue /approve even before
+  // the chat is whitelisted.
   if (
     String(userId) === OWNER_ID &&
     text
@@ -81,10 +103,17 @@ async function whitelistCheck(c, update) {
       'bot_whitelist'
     );
 
-  const whitelist =
-    whitelistRaw
-      ? JSON.parse(whitelistRaw)
+  let whitelist = [];
+
+  try {
+    whitelist = whitelistRaw
+      ? JSON.parse(
+          whitelistRaw
+        )
       : [];
+  } catch {
+    whitelist = [];
+  }
 
   if (
     whitelist.includes(
@@ -131,48 +160,60 @@ async function handleOpenRouterAI(
 }
 
 // ============================================================
+// MIDDLEWARE REGISTRY
+// ============================================================
+
+const middlewareMap = {
+  requireAdmin,
+  requireGroup,
+  rateLimit,
+  logCommand
+};
+
+// ============================================================
 // DURABLE OBJECT ACCESS
 // ============================================================
 
-function getMonitorStub(env) {
-  if (!env.MONITOR_ALARM) {
+function getDropAlarmStub(env) {
+  if (!env.DROP_ALARM) {
     throw new Error(
-      'MONITOR_ALARM Durable Object binding is missing.'
+      'DROP_ALARM Durable Object binding is missing.'
     );
   }
 
   const id =
-    env.MONITOR_ALARM.idFromName(
+    env.DROP_ALARM.idFromName(
       MONITOR_ALARM_NAME
     );
 
-  return env.MONITOR_ALARM.get(id);
+  return env.DROP_ALARM.get(id);
 }
 
-async function callMonitorDO(
+async function callDropAlarm(
   env,
   path,
-  options = {}
+  {
+    method = 'GET'
+  } = {}
 ) {
   const stub =
-    getMonitorStub(env);
+    getDropAlarmStub(
+      env
+    );
 
   const response =
     await stub.fetch(
-      `https://monitor.internal${path}`,
+      `https://drop-alarm.internal${path}`,
       {
-        method:
-          options.method || 'GET',
+        method,
         headers: {
           'content-type':
             'application/json'
-        },
-        body:
-          options.body || undefined
+        }
       }
     );
 
-  let payload = null;
+  let payload;
 
   try {
     payload =
@@ -183,46 +224,45 @@ async function callMonitorDO(
     };
   }
 
-  return {
-    response,
-    payload
-  };
+  if (!response.ok) {
+    throw new Error(
+      payload?.error ||
+        `DropAlarm returned HTTP ${response.status}`
+    );
+  }
+
+  return payload;
 }
-
-// ============================================================
-// MIDDLEWARE REGISTRY
-// ============================================================
-
-const middlewareMap = {
-  requireAdmin,
-  requireGroup,
-  rateLimit,
-  logCommand,
-};
 
 // ============================================================
 // BASIC ROUTES
 // ============================================================
 
-app.get('/', (c) => {
-  return c.json({
-    status:
-      'Stakick is alive',
-    owner:
-      c.env.OWNER_KICK_SLUG ||
-      'unknown',
-    service:
-      'stakick-bot',
-    version:
-      '3.0.0',
-    monitor:
-      'durable-object-alarm',
-    monitor_interval_ms:
-      MONITOR_INTERVAL_MS,
-    timestamp:
-      new Date().toISOString(),
-  });
-});
+app.get(
+  '/',
+  (c) => {
+    return c.json({
+      status:
+        'Stakick is alive',
+
+      owner:
+        c.env.OWNER_KICK_SLUG ||
+        'unknown',
+
+      service:
+        'stakick-bot',
+
+      version:
+        '3.1.0',
+
+      monitor:
+        'durable-object-alarm',
+
+      timestamp:
+        new Date().toISOString()
+    });
+  }
+);
 
 // ============================================================
 // HEALTH
@@ -237,6 +277,10 @@ app.get(
     const start =
       Date.now();
 
+    // ------------------------
+    // D1
+    // ------------------------
+
     try {
       await ensureSchema(
         c.env
@@ -249,33 +293,48 @@ app.get(
         .run();
 
       dbOk = true;
-    } catch (e) {
+    } catch (error) {
       console.error(
         'Health DB check failed:',
-        e.message
+        error?.message ||
+          error
       );
     }
 
+    // ------------------------
+    // KV
+    // ------------------------
+
     try {
+      const key =
+        `health_check:${Date.now()}`;
+
       await c.env.KV.put(
-        'health_check',
-        Date.now().toString(),
+        key,
+        'ok',
         {
           expirationTtl: 60
         }
       );
 
-      await c.env.KV.get(
-        'health_check'
-      );
+      const value =
+        await c.env.KV.get(
+          key
+        );
 
-      kvOk = true;
-    } catch (e) {
+      kvOk =
+        value === 'ok';
+    } catch (error) {
       console.error(
         'Health KV check failed:',
-        e.message
+        error?.message ||
+          error
       );
     }
+
+    // ------------------------
+    // DropAlarm
+    // ------------------------
 
     let monitor = {
       ok: false,
@@ -283,23 +342,26 @@ app.get(
     };
 
     try {
-      const result =
-        await callMonitorDO(
+      monitor =
+        await callDropAlarm(
           c.env,
           '/status'
         );
-
-      monitor =
-        result.payload;
-    } catch (e) {
+    } catch (error) {
       monitor = {
         ok: false,
-        error: e.message
+        error:
+          error?.message ||
+          'DropAlarm unavailable'
       };
     }
 
     const latencyMs =
       Date.now() - start;
+
+    // ------------------------
+    // Health log
+    // ------------------------
 
     if (
       c.executionCtx?.waitUntil
@@ -320,18 +382,20 @@ app.get(
           .bind(
             'http_health',
             dbOk &&
-            kvOk &&
-            monitor.ok
+              kvOk &&
+              monitor?.ok
               ? 'ok'
               : 'degraded',
-            `db=${dbOk}, kv=${kvOk}, monitor=${Boolean(
-              monitor.ok
+            `db=${dbOk},kv=${kvOk},monitor=${Boolean(
+              monitor?.ok
             )}`,
             latencyMs,
             Date.now()
           )
           .run()
-          .catch(() => {})
+          .catch(
+            () => {}
+          )
       );
     }
 
@@ -339,7 +403,9 @@ app.get(
       ok:
         dbOk &&
         kvOk &&
-        Boolean(monitor.ok),
+        Boolean(
+          monitor?.ok
+        ),
 
       db: dbOk,
       kv: kvOk,
@@ -352,7 +418,7 @@ app.get(
         'stakick-bot',
 
       version:
-        '3.0.0',
+        '3.1.0',
 
       timestamp:
         new Date().toISOString()
@@ -361,24 +427,23 @@ app.get(
 );
 
 // ============================================================
-// MANUAL MONITOR EXECUTION
+// MANUAL MONITOR RUN
 // ============================================================
 //
-// /run now goes through the Durable Object so manual runs and
-// alarm runs are serialized through the same stateful monitor.
+// /run no longer directly calls runMonitor().
+// It goes through DropAlarm so the manual execution uses the
+// same serialized monitor path as the recurring alarm.
 //
 // ============================================================
 
 app.get(
   '/run',
   async (c) => {
-    const setupSecret =
-      c.env.SETUP_SECRET;
-
     if (
-      setupSecret &&
-      c.req.query('key') !==
-        setupSecret
+      !isAuthorizedSecret(
+        c.env,
+        c.req.query('key')
+      )
     ) {
       return c.json(
         {
@@ -390,43 +455,41 @@ app.get(
       );
     }
 
-    console.log(
-      '🔥 Manual monitor run requested'
-    );
-
-    const start =
+    const started =
       Date.now();
 
     try {
       const result =
-        await callMonitorDO(
+        await callDropAlarm(
           c.env,
           '/run',
           {
-            method: 'POST'
+            method:
+              'POST'
           }
         );
 
       return c.json({
-        ...result.payload,
+        ...result,
         duration_ms:
           Date.now() -
-          start
+          started
       });
-    } catch (err) {
+    } catch (error) {
       console.error(
-        '❌ /run error:',
-        err
+        'Manual /run failed:',
+        error
       );
 
       return c.json(
         {
           ok: false,
           error:
-            err.message,
+            error?.message ||
+            'Monitor execution failed',
           duration_ms:
             Date.now() -
-            start
+            started
         },
         500
       );
@@ -459,16 +522,17 @@ app.get(
 
     try {
       const result =
-        await callMonitorDO(
+        await callDropAlarm(
           c.env,
           '/start',
           {
-            method: 'POST'
+            method:
+              'POST'
           }
         );
 
       return c.json(
-        result.payload
+        result
       );
     } catch (error) {
       console.error(
@@ -480,7 +544,8 @@ app.get(
         {
           ok: false,
           error:
-            error.message
+            error?.message ||
+            'Unable to start monitor'
         },
         500
       );
@@ -513,16 +578,17 @@ app.get(
 
     try {
       const result =
-        await callMonitorDO(
+        await callDropAlarm(
           c.env,
           '/stop',
           {
-            method: 'POST'
+            method:
+              'POST'
           }
         );
 
       return c.json(
-        result.payload
+        result
       );
     } catch (error) {
       console.error(
@@ -534,7 +600,8 @@ app.get(
         {
           ok: false,
           error:
-            error.message
+            error?.message ||
+            'Unable to stop monitor'
         },
         500
       );
@@ -567,20 +634,21 @@ app.get(
 
     try {
       const result =
-        await callMonitorDO(
+        await callDropAlarm(
           c.env,
           '/status'
         );
 
       return c.json(
-        result.payload
+        result
       );
     } catch (error) {
       return c.json(
         {
           ok: false,
           error:
-            error.message
+            error?.message ||
+            'Unable to read monitor status'
         },
         500
       );
@@ -611,6 +679,10 @@ app.post(
         update
       );
 
+      // ----------------------
+      // Whitelist
+      // ----------------------
+
       const allowed =
         await whitelistCheck(
           c,
@@ -623,6 +695,10 @@ app.post(
         );
       }
 
+      // ----------------------
+      // Cache bot username
+      // ----------------------
+
       const cachedUsername =
         await c.env.KV.get(
           'bot_username'
@@ -630,18 +706,21 @@ app.post(
 
       if (
         !cachedUsername &&
-        update.message?.from?.is_bot &&
-        update.message?.from?.username
+        update.message?.from
+          ?.is_bot &&
+        update.message?.from
+          ?.username
       ) {
         await c.env.KV.put(
           'bot_username',
-          update.message.from.username
+          update.message.from
+            .username
         );
       }
 
-      // --------------------------------------------------------
-      // BOT ADDED / REMOVED FROM CHAT
-      // --------------------------------------------------------
+      // ----------------------
+      // Bot chat membership
+      // ----------------------
 
       if (
         update.my_chat_member
@@ -686,8 +765,7 @@ app.post(
 
           if (
             !existingDefault &&
-            chat.type !==
-              'private'
+            chat.type !== 'private'
           ) {
             await c.env.KV.put(
               'default_notify_group',
@@ -695,12 +773,10 @@ app.post(
             );
           }
 
-          /*
-           * Make sure the monitor is running once the bot is
-           * actually active.
-           */
+          // Start/ensure the alarm when
+          // the bot becomes active in a chat.
           try {
-            await callMonitorDO(
+            await callDropAlarm(
               c.env,
               '/start',
               {
@@ -710,8 +786,9 @@ app.post(
             );
           } catch (error) {
             console.error(
-              'Failed to start monitor:',
-              error
+              'Unable to start DropAlarm after chat join:',
+              error?.message ||
+                error
             );
           }
         }
@@ -721,9 +798,9 @@ app.post(
         );
       }
 
-      // --------------------------------------------------------
-      // NEW MEMBERS
-      // --------------------------------------------------------
+      // ----------------------
+      // New members
+      // ----------------------
 
       if (
         update.message
@@ -735,9 +812,9 @@ app.post(
         );
       }
 
-      // --------------------------------------------------------
-      // CALLBACKS
-      // --------------------------------------------------------
+      // ----------------------
+      // Callback queries
+      // ----------------------
 
       if (
         update.callback_query
@@ -813,8 +890,7 @@ app.post(
           'menu_main'
         ) {
           const startCmd =
-            commandRegistry
-              .start;
+            commandRegistry.start;
 
           if (startCmd) {
             await startCmd[0](
@@ -839,9 +915,9 @@ app.post(
         );
       }
 
-      // --------------------------------------------------------
-      // PARSER
-      // --------------------------------------------------------
+      // ----------------------
+      // Parse command/natural text
+      // ----------------------
 
       const botUsername =
         cachedUsername ||
@@ -865,9 +941,9 @@ app.post(
         parsed
       );
 
-      // --------------------------------------------------------
-      // COMMANDS
-      // --------------------------------------------------------
+      // ----------------------
+      // Commands
+      // ----------------------
 
       if (
         parsed.type ===
@@ -883,10 +959,7 @@ app.post(
             .split('@')[0]
             .toLowerCase();
 
-        // ------------------
         // /approve
-        // ------------------
-
         if (
           cmdName ===
           'approve'
@@ -899,7 +972,7 @@ app.post(
 
           const chatId =
             update.message
-              .chat.id;
+              ?.chat?.id;
 
           const OWNER_ID =
             getOwnerId(
@@ -931,12 +1004,18 @@ app.post(
               'bot_whitelist'
             );
 
-          const whitelist =
-            whitelistRaw
-              ? JSON.parse(
-                  whitelistRaw
-                )
-              : [];
+          let whitelist = [];
+
+          try {
+            whitelist =
+              whitelistRaw
+                ? JSON.parse(
+                    whitelistRaw
+                  )
+                : [];
+          } catch {
+            whitelist = [];
+          }
 
           if (
             !whitelist.includes(
@@ -966,6 +1045,7 @@ app.post(
           );
         }
 
+        // Normal registered command
         const entry =
           commandRegistry[
             cmdName
@@ -1029,7 +1109,9 @@ app.post(
             ) {
               return (
                 result ||
-                c.text('OK')
+                c.text(
+                  'OK'
+                )
               );
             }
           }
@@ -1042,9 +1124,9 @@ app.post(
         }
       }
 
-      // --------------------------------------------------------
-      // NATURAL AI
-      // --------------------------------------------------------
+      // ----------------------
+      // Natural AI
+      // ----------------------
 
       if (
         parsed.type ===
@@ -1133,7 +1215,7 @@ app.post(
 );
 
 // ============================================================
-// KICK OAUTH
+// KICK OAUTH CALLBACK
 // ============================================================
 
 app.get(
@@ -1176,6 +1258,13 @@ app.get(
         c.req.header(
           'host'
         );
+
+      if (!host) {
+        return c.text(
+          'Unable to determine Worker hostname.',
+          500
+        );
+      }
 
       const redirectUri =
         `https://${host}/kick/oauth/callback`;
@@ -1333,6 +1422,10 @@ app.get(
         );
       }
 
+      // ----------------------
+      // Telegram webhook
+      // ----------------------
+
       const webhookUrl =
         `https://${host}/webhook`;
 
@@ -1368,6 +1461,10 @@ app.get(
       const setWebhookData =
         await setWebhookResponse.json();
 
+      // ----------------------
+      // Telegram bot info
+      // ----------------------
+
       const meResponse =
         await fetch(
           `https://api.telegram.org/bot${c.env.BOT_TOKEN}/getMe`
@@ -1378,13 +1475,19 @@ app.get(
 
       if (
         meData?.ok &&
-        meData?.result?.username
+        meData?.result
+          ?.username
       ) {
         await c.env.KV.put(
           'bot_username',
-          meData.result.username
+          meData.result
+            .username
         );
       }
+
+      // ----------------------
+      // Telegram webhook status
+      // ----------------------
 
       const webhookResponse =
         await fetch(
@@ -1394,13 +1497,15 @@ app.get(
       const webhookData =
         await webhookResponse.json();
 
-      // Start the monitor alarm.
-      let monitorStart =
-        null;
+      // ----------------------
+      // Start DropAlarm
+      // ----------------------
+
+      let monitorStart;
 
       try {
-        const result =
-          await callMonitorDO(
+        monitorStart =
+          await callDropAlarm(
             c.env,
             '/start',
             {
@@ -1408,14 +1513,12 @@ app.get(
                 'POST'
             }
           );
-
-        monitorStart =
-          result.payload;
       } catch (error) {
         monitorStart = {
           ok: false,
           error:
-            error.message
+            error?.message ||
+            'Unable to start DropAlarm'
         };
       }
 
@@ -1432,7 +1535,7 @@ app.get(
           'stakick-bot',
 
         version:
-          '3.0.0',
+          '3.1.0',
 
         webhook: {
           url:
@@ -1495,7 +1598,7 @@ app.get(
 );
 
 // ============================================================
-// FALLBACKS
+// NOT FOUND
 // ============================================================
 
 app.notFound(
@@ -1505,12 +1608,15 @@ app.notFound(
         ok: false,
         error:
           'Route not found',
+
         path:
           new URL(
             c.req.url
           ).pathname,
+
         method:
           c.req.method,
+
         service:
           'stakick-bot'
       },
@@ -1518,6 +1624,10 @@ app.notFound(
     );
   }
 );
+
+// ============================================================
+// ERROR HANDLER
+// ============================================================
 
 app.onError(
   (error, c) => {
@@ -1538,275 +1648,23 @@ app.onError(
 );
 
 // ============================================================
-// DURABLE OBJECT
+// WORKER EXPORTS
 // ============================================================
 //
-// One named Durable Object instance controls the monitor.
-//
-// It:
-//   - keeps one alarm
-//   - runs runMonitor()
-//   - schedules itself again
-//   - serializes manual /run and alarm execution
+// This is required so Wrangler can bind the DropAlarm
+// Durable Object class declared in wrangler.toml.
 //
 // ============================================================
 
-export class MonitorAlarm extends DurableObject {
-  constructor(ctx, env) {
-    super(
-      ctx,
-      env
-    );
-
-    this.env =
-      env;
-  }
-
-  async scheduleNextAlarm() {
-    const existing =
-      await this.ctx.storage.getAlarm();
-
-    if (
-      existing != null
-    ) {
-      return existing;
-    }
-
-    const next =
-      Date.now() +
-      MONITOR_INTERVAL_MS;
-
-    await this.ctx.storage.setAlarm(
-      next
-    );
-
-    return next;
-  }
-
-  async alarm(alarmInfo) {
-    const started =
-      Date.now();
-
-    let result =
-      null;
-
-    try {
-      console.log(
-        `[MONITOR ALARM] fired ` +
-        `retry=${alarmInfo?.retryCount || 0}`
-      );
-
-      result =
-        await runMonitor({
-          env: this.env,
-          executionCtx: null
-        });
-
-      console.log(
-        `[MONITOR ALARM] completed ` +
-        `${Date.now() - started}ms`
-      );
-    } catch (error) {
-      /*
-       * Don't allow one failure to permanently kill the recurring
-       * monitor. Cloudflare retries failed alarms automatically,
-       * but we also explicitly schedule the next run.
-       */
-      console.error(
-        '[MONITOR ALARM] monitor failed:',
-        error
-      );
-    } finally {
-      /*
-       * A Durable Object has one alarm at a time.
-       * Schedule the next one after this execution finishes.
-       */
-      try {
-        await this.ctx.storage.setAlarm(
-          Date.now() +
-            MONITOR_INTERVAL_MS
-        );
-      } catch (scheduleError) {
-        console.error(
-          '[MONITOR ALARM] failed to reschedule:',
-          scheduleError
-        );
-      }
-    }
-
-    return result;
-  }
-
-  async fetch(request) {
-    const url =
-      new URL(
-        request.url
-      );
-
-    // ----------------------------------------------------------
-    // STATUS
-    // ----------------------------------------------------------
-
-    if (
-      url.pathname ===
-      '/status'
-    ) {
-      const alarm =
-        await this.ctx.storage.getAlarm();
-
-      return Response.json({
-        ok: true,
-
-        running:
-          alarm != null,
-
-        alarm_at:
-          alarm,
-
-        alarm_in_ms:
-          alarm != null
-            ? Math.max(
-                0,
-                alarm -
-                  Date.now()
-              )
-            : null,
-
-        interval_ms:
-          MONITOR_INTERVAL_MS,
-
-        interval_seconds:
-          MONITOR_INTERVAL_MS /
-          1000
-      });
-    }
-
-    // ----------------------------------------------------------
-    // START
-    // ----------------------------------------------------------
-
-    if (
-      url.pathname ===
-      '/start'
-    ) {
-      const existing =
-        await this.ctx.storage.getAlarm();
-
-      if (
-        existing == null
-      ) {
-        const next =
-          Date.now() +
-          1000;
-
-        await this.ctx.storage.setAlarm(
-          next
-        );
-
-        return Response.json({
-          ok: true,
-          started: true,
-          first_alarm_at:
-            next,
-          interval_ms:
-            MONITOR_INTERVAL_MS
-        });
-      }
-
-      return Response.json({
-        ok: true,
-        started: false,
-        already_running:
-          true,
-        alarm_at:
-          existing,
-        alarm_in_ms:
-          Math.max(
-            0,
-            existing -
-              Date.now()
-          ),
-        interval_ms:
-          MONITOR_INTERVAL_MS
-      });
-    }
-
-    // ----------------------------------------------------------
-    // STOP
-    // ----------------------------------------------------------
-
-    if (
-      url.pathname ===
-      '/stop'
-    ) {
-      await this.ctx.storage.deleteAlarm();
-
-      return Response.json({
-        ok: true,
-        stopped: true
-      });
-    }
-
-    // ----------------------------------------------------------
-    // MANUAL RUN
-    // ----------------------------------------------------------
-
-    if (
-      url.pathname ===
-      '/run'
-    ) {
-      const started =
-        Date.now();
-
-      let stats =
-        null;
-
-      try {
-        stats =
-          await runMonitor({
-            env: this.env,
-            executionCtx:
-              null
-          });
-      } finally {
-        /*
-         * Make sure the recurring monitor continues after
-         * a manual run.
-         */
-        await this.ctx.storage.setAlarm(
-          Date.now() +
-            MONITOR_INTERVAL_MS
-        );
-      }
-
-      return Response.json({
-        ok: true,
-        manual: true,
-        duration_ms:
-          Date.now() -
-          started,
-        stats
-      });
-    }
-
-    return Response.json(
-      {
-        ok: false,
-        error:
-          'Unknown monitor operation'
-      },
-      {
-        status: 404
-      }
-    );
-  }
-}
-
-// ============================================================
-// WORKER ENTRYPOINT
-// ============================================================
+export {
+  DropAlarm
+};
 
 export default {
+  // ----------------------------------------------------------
+  // HTTP
+  // ----------------------------------------------------------
+
   async fetch(
     request,
     env,
@@ -1819,24 +1677,30 @@ export default {
     );
   },
 
+  // ----------------------------------------------------------
+  // CRON WATCHDOG
+  // ----------------------------------------------------------
+  //
+  // Cron runs every minute.
+  //
+  // It DOES NOT call runMonitor().
+  //
+  // It only makes sure the DropAlarm has an alarm scheduled.
+  //
+  // The Durable Object is responsible for the ~15-second
+  // recurring monitor loop.
+  //
+  // ----------------------------------------------------------
+
   async scheduled(
     controller,
     env,
     ctx
   ) {
-    /*
-     * Native Cron is now the WATCHDOG.
-     *
-     * It does NOT directly execute runMonitor().
-     * It merely makes sure the Durable Object alarm is alive.
-     *
-     * This prevents duplicate monitor executions.
-     */
-
     ctx.waitUntil(
       (async () => {
         try {
-          await callMonitorDO(
+          await callDropAlarm(
             env,
             '/start',
             {
@@ -1846,16 +1710,15 @@ export default {
           );
         } catch (error) {
           console.error(
-            'Monitor watchdog failed:',
-            error
+            '[CRON WATCHDOG] DropAlarm start failed:',
+            error?.message ||
+              error
           );
         }
       })()
     );
 
-    /*
-     * Reminders remain on the normal Cron path.
-     */
+    // Reminders remain on the normal Cron path.
     ctx.waitUntil(
       checkReminders({
         env,
