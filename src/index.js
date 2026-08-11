@@ -5,21 +5,18 @@ import { parseInput } from './parser';
 import { commandRegistry } from './config';
 import {
   requireAdmin,
-  requireGroup
+  requireGroup,
 } from './middleware/auth';
 import { rateLimit } from './middleware/rateLimit';
 import { logCommand } from './middleware/logger';
-import {
-  handleNewMembers
-} from './commands/group/welcome';
-import {
-  checkReminders
-} from './commands/external/remind';
+import { handleNewMembers } from './commands/group/welcome';
+import { checkReminders } from './commands/external/remind';
 import { handleKickEventSub } from './kick/eventsub';
 import { queryAI } from './services/ai';
 import { ensureSchema } from './db';
 
-// Premium monitor alarm Durable Object.
+// IMPORTANT:
+// This must match src/kick/dropAlarm.js exactly.
 import { DropAlarm } from './kick/dropAlarm';
 
 const app = new Hono();
@@ -35,33 +32,21 @@ const MONITOR_ALARM_NAME = 'main-monitor';
 // ============================================================
 
 function getOwnerId(env) {
-  return String(
-    env.OWNER_ID || '6816397800'
-  );
+  return String(env.OWNER_ID || '6816397800');
 }
 
-function isAuthorizedSecret(
-  env,
-  provided
-) {
-  const configured =
-    env.SETUP_SECRET;
+function isAuthorizedSecret(env, provided) {
+  const configured = env.SETUP_SECRET;
 
   if (!configured) {
     return true;
   }
 
-  return (
-    provided === configured
-  );
+  return provided === configured;
 }
 
-async function whitelistCheck(
-  c,
-  update
-) {
-  const OWNER_ID =
-    getOwnerId(c.env);
+async function whitelistCheck(c, update) {
+  const OWNER_ID = getOwnerId(c.env);
 
   const chatId =
     update.message?.chat?.id ||
@@ -78,7 +63,7 @@ async function whitelistCheck(
   const text =
     update.message?.text || '';
 
-  // Owner's private chat.
+  // Owner private chat is always allowed.
   if (
     chatType === 'private' &&
     String(userId) === OWNER_ID
@@ -86,44 +71,32 @@ async function whitelistCheck(
     return true;
   }
 
-  // Owner may issue /approve even before
-  // the chat is whitelisted.
+  // Owner can approve chats before they are whitelisted.
   if (
     String(userId) === OWNER_ID &&
-    text
-      .trim()
-      .toLowerCase()
-      .startsWith('/approve')
+    text.trim().toLowerCase().startsWith('/approve')
   ) {
     return true;
   }
 
   const whitelistRaw =
-    await c.env.KV.get(
-      'bot_whitelist'
-    );
+    await c.env.KV.get('bot_whitelist');
 
   let whitelist = [];
 
   try {
     whitelist = whitelistRaw
-      ? JSON.parse(
-          whitelistRaw
-        )
+      ? JSON.parse(whitelistRaw)
       : [];
   } catch {
     whitelist = [];
   }
 
-  if (
-    whitelist.includes(
-      String(chatId)
-    )
-  ) {
+  if (whitelist.includes(String(chatId))) {
     return true;
   }
 
-  if (update.message) {
+  if (update.message && chatId != null) {
     await tg.sendMessage(
       c.env.BOT_TOKEN,
       chatId,
@@ -134,27 +107,22 @@ async function whitelistCheck(
   return false;
 }
 
-async function handleOpenRouterAI(
-  c,
-  prompt
-) {
+async function handleOpenRouterAI(c, prompt) {
   try {
     const host =
       c.req.header('host') ||
       'stakick-bot.workers.dev';
 
-    const reply =
-      await queryAI(
-        c.env,
-        prompt,
-        { host }
-      );
-
-    return (
-      reply ||
-      '❌ Empty AI response.'
+    const reply = await queryAI(
+      c.env,
+      prompt,
+      { host }
     );
+
+    return reply || '❌ Empty AI response.';
   } catch (err) {
+    console.error('AI error:', err);
+
     return `❌ AI error: ${err.message}`;
   }
 }
@@ -167,7 +135,7 @@ const middlewareMap = {
   requireAdmin,
   requireGroup,
   rateLimit,
-  logCommand
+  logCommand,
 };
 
 // ============================================================
@@ -181,10 +149,9 @@ function getDropAlarmStub(env) {
     );
   }
 
-  const id =
-    env.DROP_ALARM.idFromName(
-      MONITOR_ALARM_NAME
-    );
+  const id = env.DROP_ALARM.idFromName(
+    MONITOR_ALARM_NAME
+  );
 
   return env.DROP_ALARM.get(id);
 }
@@ -192,35 +159,27 @@ function getDropAlarmStub(env) {
 async function callDropAlarm(
   env,
   path,
-  {
-    method = 'GET'
-  } = {}
+  method = 'GET'
 ) {
-  const stub =
-    getDropAlarmStub(
-      env
-    );
+  const stub = getDropAlarmStub(env);
 
-  const response =
-    await stub.fetch(
-      `https://drop-alarm.internal${path}`,
-      {
-        method,
-        headers: {
-          'content-type':
-            'application/json'
-        }
-      }
-    );
+  const response = await stub.fetch(
+    `https://drop-alarm.internal${path}`,
+    {
+      method,
+      headers: {
+        'content-type': 'application/json',
+      },
+    }
+  );
 
-  let payload;
+  let payload = null;
 
   try {
-    payload =
-      await response.json();
+    payload = await response.json();
   } catch {
     payload = {
-      ok: response.ok
+      ok: response.ok,
     };
   }
 
@@ -235,955 +194,821 @@ async function callDropAlarm(
 }
 
 // ============================================================
-// BASIC ROUTES
+// HOME
 // ============================================================
 
-app.get(
-  '/',
-  (c) => {
-    return c.json({
-      status:
-        'Stakick is alive',
-
-      owner:
-        c.env.OWNER_KICK_SLUG ||
-        'unknown',
-
-      service:
-        'stakick-bot',
-
-      version:
-        '3.1.0',
-
-      monitor:
-        'durable-object-alarm',
-
-      timestamp:
-        new Date().toISOString()
-    });
-  }
-);
+app.get('/', (c) => {
+  return c.json({
+    status: 'Stakick is alive',
+    owner: c.env.OWNER_KICK_SLUG || 'unknown',
+    service: 'stakick-bot',
+    version: '3.1.0',
+    monitor: 'durable-object-alarm',
+    timestamp: new Date().toISOString(),
+  });
+});
 
 // ============================================================
 // HEALTH
 // ============================================================
 
-app.get(
-  '/health',
-  async (c) => {
-    let dbOk = false;
-    let kvOk = false;
+app.get('/health', async (c) => {
+  let dbOk = false;
+  let kvOk = false;
 
-    const start =
-      Date.now();
+  const started = Date.now();
 
-    // ------------------------
-    // D1
-    // ------------------------
+  // ----------------------------
+  // D1
+  // ----------------------------
 
-    try {
-      await ensureSchema(
-        c.env
-      );
+  try {
+    await ensureSchema(c.env);
 
-      await c.env.DB
-        .prepare(
-          'SELECT 1'
-        )
-        .run();
+    await c.env.DB
+      .prepare('SELECT 1')
+      .run();
 
-      dbOk = true;
-    } catch (error) {
-      console.error(
-        'Health DB check failed:',
-        error?.message ||
-          error
-      );
-    }
-
-    // ------------------------
-    // KV
-    // ------------------------
-
-    try {
-      const key =
-        `health_check:${Date.now()}`;
-
-      await c.env.KV.put(
-        key,
-        'ok',
-        {
-          expirationTtl: 60
-        }
-      );
-
-      const value =
-        await c.env.KV.get(
-          key
-        );
-
-      kvOk =
-        value === 'ok';
-    } catch (error) {
-      console.error(
-        'Health KV check failed:',
-        error?.message ||
-          error
-      );
-    }
-
-    // ------------------------
-    // DropAlarm
-    // ------------------------
-
-    let monitor = {
-      ok: false,
-      error: null
-    };
-
-    try {
-      monitor =
-        await callDropAlarm(
-          c.env,
-          '/status'
-        );
-    } catch (error) {
-      monitor = {
-        ok: false,
-        error:
-          error?.message ||
-          'DropAlarm unavailable'
-      };
-    }
-
-    const latencyMs =
-      Date.now() - start;
-
-    // ------------------------
-    // Health log
-    // ------------------------
-
-    if (
-      c.executionCtx?.waitUntil
-    ) {
-      c.executionCtx.waitUntil(
-        c.env.DB
-          .prepare(
-            `INSERT INTO bot_health_log
-             (
-               check_type,
-               status,
-               details,
-               latency_ms,
-               created_at
-             )
-             VALUES (?, ?, ?, ?, ?)`
-          )
-          .bind(
-            'http_health',
-            dbOk &&
-              kvOk &&
-              monitor?.ok
-              ? 'ok'
-              : 'degraded',
-            `db=${dbOk},kv=${kvOk},monitor=${Boolean(
-              monitor?.ok
-            )}`,
-            latencyMs,
-            Date.now()
-          )
-          .run()
-          .catch(
-            () => {}
-          )
-      );
-    }
-
-    return c.json({
-      ok:
-        dbOk &&
-        kvOk &&
-        Boolean(
-          monitor?.ok
-        ),
-
-      db: dbOk,
-      kv: kvOk,
-      monitor,
-
-      latency_ms:
-        latencyMs,
-
-      service:
-        'stakick-bot',
-
-      version:
-        '3.1.0',
-
-      timestamp:
-        new Date().toISOString()
-    });
+    dbOk = true;
+  } catch (error) {
+    console.error(
+      'Health DB check failed:',
+      error?.message || error
+    );
   }
-);
+
+  // ----------------------------
+  // KV
+  // ----------------------------
+
+  try {
+    const key = `health_check:${Date.now()}`;
+
+    await c.env.KV.put(
+      key,
+      'ok',
+      {
+        expirationTtl: 60,
+      }
+    );
+
+    const value =
+      await c.env.KV.get(key);
+
+    kvOk = value === 'ok';
+  } catch (error) {
+    console.error(
+      'Health KV check failed:',
+      error?.message || error
+    );
+  }
+
+  // ----------------------------
+  // Durable Object
+  // ----------------------------
+
+  let monitor = {
+    ok: false,
+    error: null,
+  };
+
+  try {
+    monitor = await callDropAlarm(
+      c.env,
+      '/status'
+    );
+  } catch (error) {
+    monitor = {
+      ok: false,
+      error:
+        error?.message ||
+        'DropAlarm unavailable',
+    };
+  }
+
+  const latencyMs =
+    Date.now() - started;
+
+  // ----------------------------
+  // Persistent health log
+  // ----------------------------
+
+  if (c.executionCtx?.waitUntil) {
+    c.executionCtx.waitUntil(
+      c.env.DB
+        .prepare(
+          `INSERT INTO bot_health_log
+           (
+             check_type,
+             status,
+             details,
+             latency_ms,
+             created_at
+           )
+           VALUES (?, ?, ?, ?, ?)`
+        )
+        .bind(
+          'http_health',
+          dbOk &&
+          kvOk &&
+          Boolean(monitor?.ok)
+            ? 'ok'
+            : 'degraded',
+          `db=${dbOk},kv=${kvOk},monitor=${Boolean(
+            monitor?.ok
+          )}`,
+          latencyMs,
+          Date.now()
+        )
+        .run()
+        .catch(() => {})
+    );
+  }
+
+  return c.json({
+    ok:
+      dbOk &&
+      kvOk &&
+      Boolean(monitor?.ok),
+
+    db: dbOk,
+    kv: kvOk,
+    monitor,
+
+    latency_ms: latencyMs,
+
+    service: 'stakick-bot',
+    version: '3.1.0',
+    timestamp: new Date().toISOString(),
+  });
+});
 
 // ============================================================
 // MANUAL MONITOR RUN
 // ============================================================
 //
-// /run no longer directly calls runMonitor().
-// It goes through DropAlarm so the manual execution uses the
-// same serialized monitor path as the recurring alarm.
-//
+// Goes through the same Durable Object as the recurring alarm.
+// This prevents separate monitor execution paths.
 // ============================================================
 
-app.get(
-  '/run',
-  async (c) => {
-    if (
-      !isAuthorizedSecret(
-        c.env,
-        c.req.query('key')
-      )
-    ) {
-      return c.json(
-        {
-          ok: false,
-          error:
-            'Unauthorized. Provide setup key.'
-        },
-        401
-      );
-    }
-
-    const started =
-      Date.now();
-
-    try {
-      const result =
-        await callDropAlarm(
-          c.env,
-          '/run',
-          {
-            method:
-              'POST'
-          }
-        );
-
-      return c.json({
-        ...result,
-        duration_ms:
-          Date.now() -
-          started
-      });
-    } catch (error) {
-      console.error(
-        'Manual /run failed:',
-        error
-      );
-
-      return c.json(
-        {
-          ok: false,
-          error:
-            error?.message ||
-            'Monitor execution failed',
-          duration_ms:
-            Date.now() -
-            started
-        },
-        500
-      );
-    }
+app.get('/run', async (c) => {
+  if (
+    !isAuthorizedSecret(
+      c.env,
+      c.req.query('key')
+    )
+  ) {
+    return c.json(
+      {
+        ok: false,
+        error:
+          'Unauthorized. Provide setup key.',
+      },
+      401
+    );
   }
-);
+
+  const started = Date.now();
+
+  try {
+    const result = await callDropAlarm(
+      c.env,
+      '/run',
+      'POST'
+    );
+
+    return c.json({
+      ...result,
+      duration_ms:
+        Date.now() - started,
+    });
+  } catch (error) {
+    console.error(
+      'Manual /run failed:',
+      error
+    );
+
+    return c.json(
+      {
+        ok: false,
+        error:
+          error?.message ||
+          'Monitor execution failed',
+        duration_ms:
+          Date.now() - started,
+      },
+      500
+    );
+  }
+});
 
 // ============================================================
 // MONITOR START
 // ============================================================
 
-app.get(
-  '/monitor/start',
-  async (c) => {
-    if (
-      !isAuthorizedSecret(
-        c.env,
-        c.req.query('key')
-      )
-    ) {
-      return c.json(
-        {
-          ok: false,
-          error:
-            'Unauthorized. Provide setup key.'
-        },
-        401
-      );
-    }
-
-    try {
-      const result =
-        await callDropAlarm(
-          c.env,
-          '/start',
-          {
-            method:
-              'POST'
-          }
-        );
-
-      return c.json(
-        result
-      );
-    } catch (error) {
-      console.error(
-        'Monitor start failed:',
-        error
-      );
-
-      return c.json(
-        {
-          ok: false,
-          error:
-            error?.message ||
-            'Unable to start monitor'
-        },
-        500
-      );
-    }
+app.get('/monitor/start', async (c) => {
+  if (
+    !isAuthorizedSecret(
+      c.env,
+      c.req.query('key')
+    )
+  ) {
+    return c.json(
+      {
+        ok: false,
+        error:
+          'Unauthorized. Provide setup key.',
+      },
+      401
+    );
   }
-);
+
+  try {
+    const result = await callDropAlarm(
+      c.env,
+      '/start',
+      'POST'
+    );
+
+    return c.json(result);
+  } catch (error) {
+    console.error(
+      'Monitor start failed:',
+      error
+    );
+
+    return c.json(
+      {
+        ok: false,
+        error:
+          error?.message ||
+          'Unable to start monitor',
+      },
+      500
+    );
+  }
+});
 
 // ============================================================
 // MONITOR STOP
 // ============================================================
 
-app.get(
-  '/monitor/stop',
-  async (c) => {
-    if (
-      !isAuthorizedSecret(
-        c.env,
-        c.req.query('key')
-      )
-    ) {
-      return c.json(
-        {
-          ok: false,
-          error:
-            'Unauthorized. Provide setup key.'
-        },
-        401
-      );
-    }
-
-    try {
-      const result =
-        await callDropAlarm(
-          c.env,
-          '/stop',
-          {
-            method:
-              'POST'
-          }
-        );
-
-      return c.json(
-        result
-      );
-    } catch (error) {
-      console.error(
-        'Monitor stop failed:',
-        error
-      );
-
-      return c.json(
-        {
-          ok: false,
-          error:
-            error?.message ||
-            'Unable to stop monitor'
-        },
-        500
-      );
-    }
+app.get('/monitor/stop', async (c) => {
+  if (
+    !isAuthorizedSecret(
+      c.env,
+      c.req.query('key')
+    )
+  ) {
+    return c.json(
+      {
+        ok: false,
+        error:
+          'Unauthorized. Provide setup key.',
+      },
+      401
+    );
   }
-);
+
+  try {
+    const result = await callDropAlarm(
+      c.env,
+      '/stop',
+      'POST'
+    );
+
+    return c.json(result);
+  } catch (error) {
+    console.error(
+      'Monitor stop failed:',
+      error
+    );
+
+    return c.json(
+      {
+        ok: false,
+        error:
+          error?.message ||
+          'Unable to stop monitor',
+      },
+      500
+    );
+  }
+});
 
 // ============================================================
 // MONITOR STATUS
 // ============================================================
 
-app.get(
-  '/monitor/status',
-  async (c) => {
-    if (
-      !isAuthorizedSecret(
-        c.env,
-        c.req.query('key')
-      )
-    ) {
-      return c.json(
-        {
-          ok: false,
-          error:
-            'Unauthorized. Provide setup key.'
-        },
-        401
-      );
-    }
-
-    try {
-      const result =
-        await callDropAlarm(
-          c.env,
-          '/status'
-        );
-
-      return c.json(
-        result
-      );
-    } catch (error) {
-      return c.json(
-        {
-          ok: false,
-          error:
-            error?.message ||
-            'Unable to read monitor status'
-        },
-        500
-      );
-    }
+app.get('/monitor/status', async (c) => {
+  if (
+    !isAuthorizedSecret(
+      c.env,
+      c.req.query('key')
+    )
+  ) {
+    return c.json(
+      {
+        ok: false,
+        error:
+          'Unauthorized. Provide setup key.',
+      },
+      401
+    );
   }
-);
+
+  try {
+    const result =
+      await callDropAlarm(
+        c.env,
+        '/status'
+      );
+
+    return c.json(result);
+  } catch (error) {
+    return c.json(
+      {
+        ok: false,
+        error:
+          error?.message ||
+          'Unable to read monitor status',
+      },
+      500
+    );
+  }
+});
 
 // ============================================================
 // TELEGRAM WEBHOOK
 // ============================================================
 
-app.post(
-  '/webhook',
-  async (c) => {
-    const requestId =
-      crypto.randomUUID();
+app.post('/webhook', async (c) => {
+  const requestId =
+    crypto.randomUUID();
 
-    try {
-      await ensureSchema(
-        c.env
-      );
+  try {
+    await ensureSchema(c.env);
 
-      const update =
-        await c.req.json();
+    const update =
+      await c.req.json();
 
-      c.set(
-        'update',
+    c.set(
+      'update',
+      update
+    );
+
+    // ----------------------------
+    // Whitelist
+    // ----------------------------
+
+    const allowed =
+      await whitelistCheck(
+        c,
         update
       );
 
-      // ----------------------
-      // Whitelist
-      // ----------------------
+    if (!allowed) {
+      return c.text('OK');
+    }
 
-      const allowed =
-        await whitelistCheck(
-          c,
-          update
-        );
+    // ----------------------------
+    // Cache bot username
+    // ----------------------------
 
-      if (!allowed) {
-        return c.text(
-          'OK'
-        );
-      }
-
-      // ----------------------
-      // Cache bot username
-      // ----------------------
-
-      const cachedUsername =
-        await c.env.KV.get(
-          'bot_username'
-        );
-
-      if (
-        !cachedUsername &&
-        update.message?.from
-          ?.is_bot &&
-        update.message?.from
-          ?.username
-      ) {
-        await c.env.KV.put(
-          'bot_username',
-          update.message.from
-            .username
-        );
-      }
-
-      // ----------------------
-      // Bot chat membership
-      // ----------------------
-
-      if (
-        update.my_chat_member
-      ) {
-        const chat =
-          update.my_chat_member
-            .chat;
-
-        const newStatus =
-          update.my_chat_member
-            .new_chat_member
-            ?.status;
-
-        if (
-          newStatus === 'member' ||
-          newStatus ===
-            'administrator'
-        ) {
-          await c.env.DB
-            .prepare(
-              `INSERT INTO group_settings
-               (
-                 chat_id,
-                 welcome_msg,
-                 updated_at
-               )
-               VALUES (?, ?, ?)
-               ON CONFLICT(chat_id)
-               DO NOTHING`
-            )
-            .bind(
-              chat.id,
-              null,
-              Date.now()
-            )
-            .run();
-
-          const existingDefault =
-            await c.env.KV.get(
-              'default_notify_group'
-            );
-
-          if (
-            !existingDefault &&
-            chat.type !== 'private'
-          ) {
-            await c.env.KV.put(
-              'default_notify_group',
-              String(chat.id)
-            );
-          }
-
-          // Start/ensure the alarm when
-          // the bot becomes active in a chat.
-          try {
-            await callDropAlarm(
-              c.env,
-              '/start',
-              {
-                method:
-                  'POST'
-              }
-            );
-          } catch (error) {
-            console.error(
-              'Unable to start DropAlarm after chat join:',
-              error?.message ||
-                error
-            );
-          }
-        }
-
-        return c.text(
-          'OK'
-        );
-      }
-
-      // ----------------------
-      // New members
-      // ----------------------
-
-      if (
-        update.message
-          ?.new_chat_members
-      ) {
-        return await handleNewMembers(
-          c,
-          update
-        );
-      }
-
-      // ----------------------
-      // Callback queries
-      // ----------------------
-
-      if (
-        update.callback_query
-      ) {
-        await tg.answerCallbackQuery(
-          c.env.BOT_TOKEN,
-          update.callback_query.id
-        );
-
-        const data =
-          update.callback_query
-            .data;
-
-        const callbackMessage =
-          update.callback_query
-            .message;
-
-        if (!callbackMessage) {
-          return c.text(
-            'OK'
-          );
-        }
-
-        const callbackMap = {
-          cmd_help:
-            'help',
-          cmd_weather:
-            'weather',
-          cmd_crypto:
-            'crypto',
-          cmd_ai:
-            'ask',
-          cmd_remind:
-            'remind',
-          cmd_kick:
-            'kickstatus'
-        };
-
-        const cmdName =
-          callbackMap[data];
-
-        if (
-          cmdName &&
-          commandRegistry[
-            cmdName
-          ]
-        ) {
-          const [
-            handler
-          ] =
-            commandRegistry[
-              cmdName
-            ];
-
-          await handler(
-            c,
-            {
-              message:
-                callbackMessage
-            },
-            {
-              args: ''
-            }
-          );
-
-          return c.text(
-            'OK'
-          );
-        }
-
-        if (
-          data ===
-          'menu_main'
-        ) {
-          const startCmd =
-            commandRegistry.start;
-
-          if (startCmd) {
-            await startCmd[0](
-              c,
-              {
-                message:
-                  callbackMessage
-              },
-              {
-                args: ''
-              }
-            );
-          }
-
-          return c.text(
-            'OK'
-          );
-        }
-
-        return c.text(
-          'OK'
-        );
-      }
-
-      // ----------------------
-      // Parse command/natural text
-      // ----------------------
-
-      const botUsername =
-        cachedUsername ||
-        c.env.BOT_USERNAME ||
-        '';
-
-      const parsed =
-        parseInput(
-          update,
-          botUsername
-        );
-
-      if (!parsed) {
-        return c.text(
-          'OK'
-        );
-      }
-
-      c.set(
-        'parsed',
-        parsed
+    const cachedUsername =
+      await c.env.KV.get(
+        'bot_username'
       );
 
-      // ----------------------
-      // Commands
-      // ----------------------
+    if (
+      !cachedUsername &&
+      update.message?.from?.is_bot &&
+      update.message?.from?.username
+    ) {
+      await c.env.KV.put(
+        'bot_username',
+        update.message.from.username
+      );
+    }
+
+    // ----------------------------
+    // Bot membership events
+    // ----------------------------
+
+    if (update.my_chat_member) {
+      const chat =
+        update.my_chat_member.chat;
+
+      const newStatus =
+        update.my_chat_member
+          .new_chat_member
+          ?.status;
 
       if (
-        parsed.type ===
-          'command' &&
-        parsed.command
+        newStatus === 'member' ||
+        newStatus === 'administrator'
       ) {
-        const cmdName =
-          parsed.command
-            .replace(
-              /^\//,
-              ''
-            )
-            .split('@')[0]
-            .toLowerCase();
+        await c.env.DB
+          .prepare(
+            `INSERT INTO group_settings
+             (
+               chat_id,
+               welcome_msg,
+               updated_at
+             )
+             VALUES (?, ?, ?)
+             ON CONFLICT(chat_id)
+             DO NOTHING`
+          )
+          .bind(
+            chat.id,
+            null,
+            Date.now()
+          )
+          .run();
 
-        // /approve
-        if (
-          cmdName ===
-          'approve'
-        ) {
-          const userId =
-            String(
-              update.message
-                ?.from?.id
-            );
-
-          const chatId =
-            update.message
-              ?.chat?.id;
-
-          const OWNER_ID =
-            getOwnerId(
-              c.env
-            );
-
-          if (
-            userId !==
-            OWNER_ID
-          ) {
-            await tg.sendMessage(
-              c.env.BOT_TOKEN,
-              chatId,
-              '❌ Owner only.'
-            );
-
-            return c.text(
-              'OK'
-            );
-          }
-
-          const targetId =
-            parsed.args
-              ?.trim() ||
-            String(chatId);
-
-          const whitelistRaw =
-            await c.env.KV.get(
-              'bot_whitelist'
-            );
-
-          let whitelist = [];
-
-          try {
-            whitelist =
-              whitelistRaw
-                ? JSON.parse(
-                    whitelistRaw
-                  )
-                : [];
-          } catch {
-            whitelist = [];
-          }
-
-          if (
-            !whitelist.includes(
-              targetId
-            )
-          ) {
-            whitelist.push(
-              targetId
-            );
-
-            await c.env.KV.put(
-              'bot_whitelist',
-              JSON.stringify(
-                whitelist
-              )
-            );
-          }
-
-          await tg.sendMessage(
-            c.env.BOT_TOKEN,
-            chatId,
-            `✅ Group ${targetId} approved.`
+        const existingDefault =
+          await c.env.KV.get(
+            'default_notify_group'
           );
 
-          return c.text(
-            'OK'
+        if (
+          !existingDefault &&
+          chat.type !== 'private'
+        ) {
+          await c.env.KV.put(
+            'default_notify_group',
+            String(chat.id)
           );
         }
 
-        // Normal registered command
-        const entry =
+        // Ensure the high-frequency alarm is alive.
+        try {
+          await callDropAlarm(
+            c.env,
+            '/start',
+            'POST'
+          );
+        } catch (error) {
+          console.error(
+            'Unable to start DropAlarm after bot joined chat:',
+            error?.message ||
+              error
+          );
+        }
+      }
+
+      return c.text('OK');
+    }
+
+    // ----------------------------
+    // New members
+    // ----------------------------
+
+    if (
+      update.message?.new_chat_members
+    ) {
+      return await handleNewMembers(
+        c,
+        update
+      );
+    }
+
+    // ----------------------------
+    // Callback queries
+    // ----------------------------
+
+    if (update.callback_query) {
+      await tg.answerCallbackQuery(
+        c.env.BOT_TOKEN,
+        update.callback_query.id
+      );
+
+      const data =
+        update.callback_query.data;
+
+      const callbackMessage =
+        update.callback_query.message;
+
+      if (!callbackMessage) {
+        return c.text('OK');
+      }
+
+      const callbackMap = {
+        cmd_help: 'help',
+        cmd_weather: 'weather',
+        cmd_crypto: 'crypto',
+        cmd_ai: 'ask',
+        cmd_remind: 'remind',
+        cmd_kick: 'kickstatus',
+      };
+
+      const cmdName =
+        callbackMap[data];
+
+      if (
+        cmdName &&
+        commandRegistry[cmdName]
+      ) {
+        const [
+          handler,
+        ] =
           commandRegistry[
             cmdName
           ];
 
-        if (entry) {
-          const [
-            handler,
-            middlewares = [],
-            scope
-          ] = entry;
-
-          const chatType =
-            update.message
-              ?.chat?.type;
-
-          if (
-            scope === 'group' &&
-            chatType ===
-              'private'
-          ) {
-            await tg.sendMessage(
-              c.env.BOT_TOKEN,
-              update.message
-                .chat.id,
-              'Use this command in a group!'
-            );
-
-            return c.text(
-              'OK'
-            );
+        await handler(
+          c,
+          {
+            message:
+              callbackMessage,
+          },
+          {
+            args: '',
           }
+        );
 
-          for (
-            const mwName
-            of middlewares
-          ) {
-            const middleware =
-              middlewareMap[
-                mwName
-              ];
-
-            if (!middleware) {
-              continue;
-            }
-
-            let nextCalled =
-              false;
-
-            const result =
-              await middleware(
-                c,
-                () => {
-                  nextCalled =
-                    true;
-                }
-              );
-
-            if (
-              !nextCalled
-            ) {
-              return (
-                result ||
-                c.text(
-                  'OK'
-                )
-              );
-            }
-          }
-
-          return await handler(
-            c,
-            update,
-            parsed
-          );
-        }
+        return c.text('OK');
       }
 
-      // ----------------------
-      // Natural AI
-      // ----------------------
+      if (data === 'menu_main') {
+        const startCmd =
+          commandRegistry.start;
 
-      if (
-        parsed.type ===
-          'natural' &&
-        parsed.isMention
-      ) {
-        const reply =
-          await handleOpenRouterAI(
+        if (startCmd) {
+          await startCmd[0](
             c,
-            parsed.args ||
-              parsed.text ||
-              ''
+            {
+              message:
+                callbackMessage,
+            },
+            {
+              args: '',
+            }
+          );
+        }
+
+        return c.text('OK');
+      }
+
+      return c.text('OK');
+    }
+
+    // ----------------------------
+    // Parse message
+    // ----------------------------
+
+    const botUsername =
+      cachedUsername ||
+      c.env.BOT_USERNAME ||
+      '';
+
+    const parsed =
+      parseInput(
+        update,
+        botUsername
+      );
+
+    if (!parsed) {
+      return c.text('OK');
+    }
+
+    c.set(
+      'parsed',
+      parsed
+    );
+
+    // ========================================================
+    // COMMANDS
+    // ========================================================
+
+    if (
+      parsed.type === 'command' &&
+      parsed.command
+    ) {
+      const cmdName =
+        parsed.command
+          .replace(/^\//, '')
+          .split('@')[0]
+          .toLowerCase();
+
+      // ------------------------------------------------------
+      // /approve
+      // ------------------------------------------------------
+
+      if (cmdName === 'approve') {
+        const userId =
+          String(
+            update.message?.from?.id
+          );
+
+        const chatId =
+          update.message?.chat?.id;
+
+        const OWNER_ID =
+          getOwnerId(
+            c.env
           );
 
         if (
-          update.message
-            ?.chat?.id
+          userId !== OWNER_ID
         ) {
           await tg.sendMessage(
             c.env.BOT_TOKEN,
-            update.message
-              .chat.id,
-            reply,
-            {
-              parse_mode:
-                'HTML'
-            }
+            chatId,
+            '❌ Owner only.'
+          );
+
+          return c.text('OK');
+        }
+
+        const targetId =
+          parsed.args?.trim() ||
+          String(chatId);
+
+        const whitelistRaw =
+          await c.env.KV.get(
+            'bot_whitelist'
+          );
+
+        let whitelist = [];
+
+        try {
+          whitelist =
+            whitelistRaw
+              ? JSON.parse(
+                  whitelistRaw
+                )
+              : [];
+        } catch {
+          whitelist = [];
+        }
+
+        if (
+          !whitelist.includes(
+            targetId
+          )
+        ) {
+          whitelist.push(
+            targetId
+          );
+
+          await c.env.KV.put(
+            'bot_whitelist',
+            JSON.stringify(
+              whitelist
+            )
           );
         }
 
-        return c.text(
-          'OK'
+        await tg.sendMessage(
+          c.env.BOT_TOKEN,
+          chatId,
+          `✅ Group ${targetId} approved.`
+        );
+
+        // Ensure monitoring is running.
+        try {
+          await callDropAlarm(
+            c.env,
+            '/start',
+            'POST'
+          );
+        } catch (error) {
+          console.error(
+            'Unable to start DropAlarm after approval:',
+            error?.message ||
+              error
+          );
+        }
+
+        return c.text('OK');
+      }
+
+      // ------------------------------------------------------
+      // Registered commands
+      // ------------------------------------------------------
+
+      const entry =
+        commandRegistry[
+          cmdName
+        ];
+
+      if (entry) {
+        const [
+          handler,
+          middlewares = [],
+          scope,
+        ] = entry;
+
+        const chatType =
+          update.message
+            ?.chat?.type;
+
+        if (
+          scope === 'group' &&
+          chatType === 'private'
+        ) {
+          await tg.sendMessage(
+            c.env.BOT_TOKEN,
+            update.message.chat.id,
+            'Use this command in a group!'
+          );
+
+          return c.text('OK');
+        }
+
+        for (
+          const mwName
+          of middlewares
+        ) {
+          const middleware =
+            middlewareMap[
+              mwName
+            ];
+
+          if (!middleware) {
+            continue;
+          }
+
+          let nextCalled =
+            false;
+
+          const result =
+            await middleware(
+              c,
+              () => {
+                nextCalled = true;
+              }
+            );
+
+          if (!nextCalled) {
+            return (
+              result ||
+              c.text('OK')
+            );
+          }
+        }
+
+        return await handler(
+          c,
+          update,
+          parsed
+        );
+      }
+    }
+
+    // ========================================================
+    // NATURAL LANGUAGE AI
+    // ========================================================
+
+    if (
+      parsed.type === 'natural' &&
+      parsed.isMention
+    ) {
+      const reply =
+        await handleOpenRouterAI(
+          c,
+          parsed.args ||
+            parsed.text ||
+            ''
+        );
+
+      if (
+        update.message?.chat?.id
+      ) {
+        await tg.sendMessage(
+          c.env.BOT_TOKEN,
+          update.message.chat.id,
+          reply,
+          {
+            parse_mode: 'HTML',
+          }
         );
       }
 
-      return c.text(
-        'OK'
-      );
-    } catch (error) {
-      console.error(
-        `[${requestId}] Webhook error:`,
-        error
-      );
-
-      return c.json(
-        {
-          ok: false,
-          error:
-            'Webhook processing failed',
-          request_id:
-            requestId
-        },
-        500
-      );
+      return c.text('OK');
     }
+
+    return c.text('OK');
+  } catch (error) {
+    console.error(
+      `[${requestId}] Webhook error:`,
+      error
+    );
+
+    return c.json(
+      {
+        ok: false,
+        error:
+          'Webhook processing failed',
+        request_id:
+          requestId,
+      },
+      500
+    );
   }
-);
+});
 
 // ============================================================
 // KICK EVENTSUB
@@ -1206,7 +1031,7 @@ app.post(
         {
           ok: false,
           error:
-            'Kick EventSub processing failed'
+            'Kick EventSub processing failed',
         },
         500
       );
@@ -1223,19 +1048,12 @@ app.get(
   async (c) => {
     try {
       const code =
-        c.req.query(
-          'code'
-        );
+        c.req.query('code');
 
       const state =
-        c.req.query(
-          'state'
-        );
+        c.req.query('state');
 
-      if (
-        !code ||
-        !state
-      ) {
+      if (!code || !state) {
         return c.text(
           'Missing OAuth parameters.',
           400
@@ -1255,9 +1073,7 @@ app.get(
       }
 
       const host =
-        c.req.header(
-          'host'
-        );
+        c.req.header('host');
 
       if (!host) {
         return c.text(
@@ -1273,51 +1089,38 @@ app.get(
         await fetch(
           'https://id.kick.com/oauth/token',
           {
-            method:
-              'POST',
-
+            method: 'POST',
             headers: {
               'Content-Type':
-                'application/json'
+                'application/json',
             },
-
-            body:
-              JSON.stringify({
-                grant_type:
-                  'authorization_code',
-
-                client_id:
-                  c.env.KICK_CLIENT_ID,
-
-                client_secret:
-                  c.env.KICK_CLIENT_SECRET,
-
-                code,
-
-                redirect_uri:
-                  redirectUri
-              })
+            body: JSON.stringify({
+              grant_type:
+                'authorization_code',
+              client_id:
+                c.env.KICK_CLIENT_ID,
+              client_secret:
+                c.env.KICK_CLIENT_SECRET,
+              code,
+              redirect_uri:
+                redirectUri,
+            }),
           }
         );
 
       const data =
         await response.json();
 
-      if (
-        data.access_token
-      ) {
+      if (data.access_token) {
         await c.env.KV.put(
           'kick_user_token',
           data.access_token,
           {
-            expirationTtl:
-              3500
+            expirationTtl: 3500,
           }
         );
 
-        if (
-          data.refresh_token
-        ) {
+        if (data.refresh_token) {
           await c.env.KV.put(
             'kick_refresh_token_backup',
             data.refresh_token
@@ -1366,12 +1169,16 @@ app.get(
   '/setup',
   async (c) => {
     try {
+      // ----------------------
+      // Basic bindings
+      // ----------------------
+
       if (!c.env.BOT_TOKEN) {
         return c.json(
           {
             ok: false,
             error:
-              'BOT_TOKEN is not configured as a Worker secret.'
+              'BOT_TOKEN is not configured as a Worker secret.',
           },
           500
         );
@@ -1382,45 +1189,75 @@ app.get(
           {
             ok: false,
             error:
-              'KV binding is missing from the Worker.'
+              'KV binding is missing from the Worker.',
           },
           500
         );
       }
 
-      const setupSecret =
-        c.env.SETUP_SECRET;
+      if (!c.env.DB) {
+        return c.json(
+          {
+            ok: false,
+            error:
+              'DB binding is missing from the Worker.',
+          },
+          500
+        );
+      }
+
+      if (!c.env.DROP_ALARM) {
+        return c.json(
+          {
+            ok: false,
+            error:
+              'DROP_ALARM Durable Object binding is missing from the Worker.',
+          },
+          500
+        );
+      }
+
+      // ----------------------
+      // Setup authorization
+      // ----------------------
 
       if (
-        setupSecret &&
-        c.req.query('key') !==
-          setupSecret
+        !isAuthorizedSecret(
+          c.env,
+          c.req.query('key')
+        )
       ) {
         return c.json(
           {
             ok: false,
             error:
-              'Unauthorized. Provide the setup key.'
+              'Unauthorized. Provide the setup key.',
           },
           401
         );
       }
 
       const host =
-        c.req.header(
-          'host'
-        );
+        c.req.header('host');
 
       if (!host) {
         return c.json(
           {
             ok: false,
             error:
-              'Unable to determine Worker hostname.'
+              'Unable to determine Worker hostname.',
           },
           500
         );
       }
+
+      // ----------------------
+      // Database schema
+      // ----------------------
+
+      await ensureSchema(
+        c.env
+      );
 
       // ----------------------
       // Telegram webhook
@@ -1433,28 +1270,22 @@ app.get(
         await fetch(
           `https://api.telegram.org/bot${c.env.BOT_TOKEN}/setWebhook`,
           {
-            method:
-              'POST',
-
+            method: 'POST',
             headers: {
               'Content-Type':
-                'application/json'
+                'application/json',
             },
-
-            body:
-              JSON.stringify({
-                url: webhookUrl,
-
-                allowed_updates: [
-                  'message',
-                  'callback_query',
-                  'chat_member',
-                  'my_chat_member'
-                ],
-
-                drop_pending_updates:
-                  true
-              })
+            body: JSON.stringify({
+              url: webhookUrl,
+              allowed_updates: [
+                'message',
+                'callback_query',
+                'chat_member',
+                'my_chat_member',
+              ],
+              drop_pending_updates:
+                true,
+            }),
           }
         );
 
@@ -1462,7 +1293,7 @@ app.get(
         await setWebhookResponse.json();
 
       // ----------------------
-      // Telegram bot info
+      // Telegram bot identity
       // ----------------------
 
       const meResponse =
@@ -1475,13 +1306,11 @@ app.get(
 
       if (
         meData?.ok &&
-        meData?.result
-          ?.username
+        meData?.result?.username
       ) {
         await c.env.KV.put(
           'bot_username',
-          meData.result
-            .username
+          meData.result.username
         );
       }
 
@@ -1501,24 +1330,26 @@ app.get(
       // Start DropAlarm
       // ----------------------
 
-      let monitorStart;
+      let monitorStart = null;
 
       try {
         monitorStart =
           await callDropAlarm(
             c.env,
             '/start',
-            {
-              method:
-                'POST'
-            }
+            'POST'
           );
       } catch (error) {
+        console.error(
+          'DropAlarm start during setup failed:',
+          error
+        );
+
         monitorStart = {
           ok: false,
           error:
             error?.message ||
-            'Unable to start DropAlarm'
+            'Unable to start DropAlarm',
         };
       }
 
@@ -1529,6 +1360,9 @@ app.get(
           ) &&
           Boolean(
             meData?.ok
+          ) &&
+          Boolean(
+            c.env.DROP_ALARM
           ),
 
         service:
@@ -1538,42 +1372,35 @@ app.get(
           '3.1.0',
 
         webhook: {
-          url:
-            webhookUrl,
-
+          url: webhookUrl,
           registration:
             setWebhookData,
-
           status:
-            webhookData
+            webhookData,
         },
 
-        bot:
-          meData?.ok
-            ? {
-                id:
-                  meData.result.id,
-
-                username:
-                  meData.result.username,
-
-                first_name:
-                  meData.result.first_name,
-
-                is_bot:
-                  meData.result.is_bot
-              }
-            : {
-                error:
-                  meData?.description ||
-                  'Unable to retrieve bot information.'
-              },
+        bot: meData?.ok
+          ? {
+              id:
+                meData.result.id,
+              username:
+                meData.result.username,
+              first_name:
+                meData.result.first_name,
+              is_bot:
+                meData.result.is_bot,
+            }
+          : {
+              error:
+                meData?.description ||
+                'Unable to retrieve bot information.',
+            },
 
         monitor:
           monitorStart,
 
         timestamp:
-          new Date().toISOString()
+          new Date().toISOString(),
       });
     } catch (error) {
       console.error(
@@ -1589,7 +1416,7 @@ app.get(
           message:
             error instanceof Error
               ? error.message
-              : 'Unknown error'
+              : 'Unknown error',
         },
         500
       );
@@ -1601,70 +1428,61 @@ app.get(
 // NOT FOUND
 // ============================================================
 
-app.notFound(
-  (c) => {
-    return c.json(
-      {
-        ok: false,
-        error:
-          'Route not found',
-
-        path:
-          new URL(
-            c.req.url
-          ).pathname,
-
-        method:
-          c.req.method,
-
-        service:
-          'stakick-bot'
-      },
-      404
-    );
-  }
-);
+app.notFound((c) => {
+  return c.json(
+    {
+      ok: false,
+      error: 'Route not found',
+      path:
+        new URL(
+          c.req.url
+        ).pathname,
+      method: c.req.method,
+      service:
+        'stakick-bot',
+    },
+    404
+  );
+});
 
 // ============================================================
-// ERROR HANDLER
+// GLOBAL ERROR HANDLER
 // ============================================================
 
-app.onError(
-  (error, c) => {
-    console.error(
-      'Unhandled Worker error:',
-      error
-    );
+app.onError((error, c) => {
+  console.error(
+    'Unhandled Worker error:',
+    error
+  );
 
-    return c.json(
-      {
-        ok: false,
-        error:
-          'Internal server error'
-      },
-      500
-    );
-  }
-);
+  return c.json(
+    {
+      ok: false,
+      error:
+        'Internal server error',
+    },
+    500
+  );
+});
 
 // ============================================================
-// WORKER EXPORTS
+// DURABLE OBJECT EXPORT
 // ============================================================
 //
-// This is required so Wrangler can bind the DropAlarm
-// Durable Object class declared in wrangler.toml.
+// CRITICAL FOR WRANGLER:
 //
+// Cloudflare already has a provisioned DropAlarm namespace.
+// Therefore the Worker MUST export the DropAlarm class.
+// This fixes the exact reconciliation error from deployment #78.
 // ============================================================
 
-export {
-  DropAlarm
-};
+export { DropAlarm };
+
+// ============================================================
+// WORKER ENTRYPOINT
+// ============================================================
 
 export default {
-  // ----------------------------------------------------------
-  // HTTP
-  // ----------------------------------------------------------
-
   async fetch(
     request,
     env,
@@ -1677,20 +1495,20 @@ export default {
     );
   },
 
-  // ----------------------------------------------------------
+  // ==========================================================
   // CRON WATCHDOG
-  // ----------------------------------------------------------
+  // ==========================================================
   //
-  // Cron runs every minute.
+  // Native Cloudflare Cron runs once per minute.
   //
-  // It DOES NOT call runMonitor().
+  // It does NOT execute runMonitor directly.
   //
-  // It only makes sure the DropAlarm has an alarm scheduled.
+  // It simply ensures the persistent Durable Object alarm
+  // is alive.
   //
-  // The Durable Object is responsible for the ~15-second
-  // recurring monitor loop.
-  //
-  // ----------------------------------------------------------
+  // The DropAlarm object is responsible for the recurring
+  // high-frequency monitor loop.
+  // ==========================================================
 
   async scheduled(
     controller,
@@ -1703,14 +1521,15 @@ export default {
           await callDropAlarm(
             env,
             '/start',
-            {
-              method:
-                'POST'
-            }
+            'POST'
+          );
+
+          console.log(
+            '[CRON] DropAlarm watchdog OK'
           );
         } catch (error) {
           console.error(
-            '[CRON WATCHDOG] DropAlarm start failed:',
+            '[CRON] DropAlarm watchdog failed:',
             error?.message ||
               error
           );
@@ -1718,13 +1537,13 @@ export default {
       })()
     );
 
-    // Reminders remain on the normal Cron path.
+    // Reminders remain on the regular Cron schedule.
     ctx.waitUntil(
       checkReminders({
         env,
         executionCtx:
-          ctx
+          ctx,
       })
     );
-  }
+  },
 };
