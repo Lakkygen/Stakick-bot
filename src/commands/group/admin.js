@@ -29,8 +29,7 @@ export async function ban(c, update, parsed) {
 
   await tg.banChatMember(c.env.BOT_TOKEN, message.chat.id, target.id);
   await tg.sendMessage(c.env.BOT_TOKEN, message.chat.id,
-    `🚫 <a href="tg://user?id=${target.id}">${target.first_name}</a> has been banned.`,
-    { parse_mode: 'HTML' });
+    `🚫 ${target.first_name} has been banned.`, { parse_mode: 'HTML' });
 
   await c.env.DB.prepare(
     'INSERT INTO mod_logs (chat_id, admin_id, target_id, action, reason, created_at) VALUES (?, ?, ?, ?, ?, ?)'
@@ -48,7 +47,7 @@ export async function unban(c, update, parsed) {
   }
   await tg.unbanChatMember(c.env.BOT_TOKEN, message.chat.id, target.id);
   await tg.sendMessage(c.env.BOT_TOKEN, message.chat.id,
-    `✅ <a href="tg://user?id=${target.id}">${target.first_name}</a> unbanned.`, { parse_mode: 'HTML' });
+    `✅ ${target.first_name} unbanned.`, { parse_mode: 'HTML' });
   return c.text('OK');
 }
 
@@ -73,8 +72,7 @@ export async function mute(c, update, parsed) {
   }, until);
 
   await tg.sendMessage(c.env.BOT_TOKEN, message.chat.id,
-    `🔇 <a href="tg://user?id=${target.id}">${target.first_name}</a> muted for ${minutes}m.`,
-    { parse_mode: 'HTML' });
+    `🔇 ${target.first_name} muted for ${minutes}m.`, { parse_mode: 'HTML' });
   return c.text('OK');
 }
 
@@ -96,13 +94,11 @@ export async function warn(c, update, parsed) {
     await tg.banChatMember(c.env.BOT_TOKEN, message.chat.id, target.id);
     await c.env.KV.delete(key);
     await tg.sendMessage(c.env.BOT_TOKEN, message.chat.id,
-      `🚫 <a href="tg://user?id=${target.id}">${target.first_name}</a> hit 3/3 warnings and was banned.`,
-      { parse_mode: 'HTML' });
+      `🚫 ${target.first_name} hit 3/3 warnings and was banned.`, { parse_mode: 'HTML' });
   } else {
     await c.env.KV.put(key, JSON.stringify(warns));
     await tg.sendMessage(c.env.BOT_TOKEN, message.chat.id,
-      `⚠️ <a href="tg://user?id=${target.id}">${target.first_name}</a> — Warning ${warns.length}/3\n<i>${reason}</i>`,
-      { parse_mode: 'HTML' });
+      `⚠️ ${target.first_name} — Warning ${warns.length}/3\\n<i>${reason}</i>`, { parse_mode: 'HTML' });
   }
   return c.text('OK');
 }
@@ -120,12 +116,17 @@ export async function purge(c, update, parsed) {
   }
 
   const confirm = await tg.sendMessage(c.env.BOT_TOKEN, message.chat.id, `🧹 Deleted ${deleted} messages.`);
-  c.executionCtx.waitUntil(
-    new Promise(r => setTimeout(r, 5000)).then(async () => {
-      const cid = (await confirm.json()).result?.message_id;
-      if (cid) await tg.deleteMessage(c.env.BOT_TOKEN, message.chat.id, cid);
-    })
-  );
+
+  if (c.executionCtx?.waitUntil) {
+    c.executionCtx.waitUntil(
+      new Promise(r => setTimeout(r, 5000)).then(async () => {
+        try {
+          const cid = (await confirm.json()).result?.message_id;
+          if (cid) await tg.deleteMessage(c.env.BOT_TOKEN, message.chat.id, cid);
+        } catch (e) { /* ignore */ }
+      })
+    );
+  }
 
   return c.text('OK');
 }
@@ -138,12 +139,12 @@ export async function listWarns(c, update, parsed) {
 
   if (!warns.length) {
     await tg.sendMessage(c.env.BOT_TOKEN, message.chat.id,
-      `<a href="tg://user?id=${target.id}">${target.first_name}</a> has no warnings.`, { parse_mode: 'HTML' });
+      `✅ ${target.first_name} has no warnings.`, { parse_mode: 'HTML' });
     return c.text('OK');
   }
 
-  const list = warns.map((w, i) => `${i + 1}. ${w.reason} (by ${w.by})`).join('\n');
+  const list = warns.map((w, i) => `${i + 1}. ${w.reason} (by ${w.by})`).join('\\n');
   await tg.sendMessage(c.env.BOT_TOKEN, message.chat.id,
-    `⚠️ Warnings for <a href="tg://user?id=${target.id}">${target.first_name}</a>:\n${list}`, { parse_mode: 'HTML' });
+    `⚠️ Warnings for ${target.first_name}:\\n${list}`, { parse_mode: 'HTML' });
   return c.text('OK');
 }
