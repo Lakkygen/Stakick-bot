@@ -10,7 +10,6 @@ OWNER_ID = "6816397800"
 ENVIRONMENT = "production"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODEL = "poolside/laguna-xs-2.1:free"
-BOT_TOKEN = "8897459739:AAFF6XZWwqSx4p1J5xeMMUhZiZHSx90p7BA"
 
 [[kv_namespaces]]
 binding = "KV"
@@ -21,9 +20,18 @@ binding = "DB"
 database_name = "stakick-db"
 database_id = "735e166d-dc36-4a19-8fdb-f0b33ef41f90"
 
+[durable_objects]
+bindings = [
+  { name = "MONITOR_ALARM", class_name = "MonitorAlarm" }
+]
+
 [[migrations]]
 tag = "delete-drop-alarm"
 deleted_classes = ["DropAlarm"]
+
+[[migrations]]
+tag = "add-monitor-alarm-v1"
+new_sqlite_classes = ["MonitorAlarm"]
 
 [triggers]
 crons = ["* * * * *"]
