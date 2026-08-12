@@ -1,5 +1,5 @@
 import { tg } from '../telegram';
-import { fetchDropCampaigns } from '../api';
+import { fetchDropCampaigns } from './api';
 
 const DROP_CHECK_TTL = 20;
 const MAX_CAMPAIGNS = 20;
