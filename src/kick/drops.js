@@ -1,949 +1,490 @@
 import { tg } from '../telegram';
+import { fetchDropCampaigns } from '../api';
 
-// ============================================================
-// STAKICK DROP DETECTOR
-// ============================================================
-//
-// This module is intentionally lightweight.
-//
-// PRIMARY detection:
-//   monitor.js -> KICK Drops API
-//
-// This module is a SECONDARY/LOCAL detector for situations where
-// another part of the bot wants to inspect a livestream directly.
-//
-// It does NOT:
-//   - guess drops from random words in titles
-//   - treat "bonus" or "reward" text as proof of a drop
-//   - create competing cooldown systems
-//   - suppress legitimate API alerts
-//
-// It can:
-//   - inspect known drop/reward fields in KICK responses
-//   - detect explicit active flags
-//   - correlate a livestream with known campaign data
-//   - send a fallback alert when explicitly requested
-//   - record detections in D1
-//
-// ============================================================
+const DROP_CHECK_TTL = 20;
+const MAX_CAMPAIGNS = 20;
+const MAX_CHANNELS_PER_CAMPAIGN = 12;
 
-const DROP_FIELD_NAMES = new Set([
-  'drop',
-  'drops',
-  'drop_active',
-  'drops_active',
-  'drop_enabled',
-  'drops_enabled',
-  'reward',
-  'rewards',
-  'reward_active',
-  'rewards_active',
-  'campaign',
-  'campaigns',
-  'quest',
-  'quests',
-  'claim',
-  'claims',
-  'redeem',
-  'redeemable',
-  'giveaway',
-  'prize',
-  'loot',
-]);
+function safeDate(value) {
+  if (!value) return null;
 
-const ACTIVE_VALUES = new Set([
-  'true',
-  'yes',
-  'active',
-  'enabled',
-  'available',
-  'live',
-  'on',
-]);
-
-// ------------------------------------------------------------
-// GENERIC HELPERS
-// ------------------------------------------------------------
-
-function normalize(value) {
-  return String(value ?? '')
-    .trim()
-    .toLowerCase();
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
 }
 
-function safeString(value, fallback = '') {
-  if (value == null) return fallback;
-  return String(value);
+function formatDate(value) {
+  const date = safeDate(value);
+  if (!date) return 'Unknown';
+
+  return date.toLocaleString('en-US', {
+    timeZone: 'UTC',
+    year: 'numeric',
+    month: 'short',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }) + ' UTC';
+}
+
+function getCampaignStatus(campaign, now = Date.now()) {
+  const start = safeDate(campaign.starts_at)?.getTime() ?? null;
+  const end = safeDate(campaign.ends_at)?.getTime() ?? null;
+
+  if (campaign.status === 'expired') return 'expired';
+
+  if (start && now < start) return 'upcoming';
+
+  if (end && now >= end) return 'expired';
+
+  if (campaign.status === 'active') return 'active';
+
+  if (start && (!end || now < end)) return 'active';
+
+  return String(campaign.status || 'unknown').toLowerCase();
+}
+
+function getChannels(campaign) {
+  if (!Array.isArray(campaign?.channels)) return [];
+
+  return campaign.channels
+    .filter(Boolean)
+    .map(channel => {
+      const slug = channel.slug || channel.user?.username || null;
+      const username = channel.user?.username || slug;
+
+      return {
+        slug,
+        username,
+      };
+    })
+    .filter(channel => channel.slug);
+}
+
+function getRewards(campaign) {
+  if (!Array.isArray(campaign?.rewards)) return [];
+
+  return campaign.rewards
+    .filter(Boolean)
+    .map(reward => ({
+      name: reward.name || 'Unnamed reward',
+      requiredUnits: reward.required_units ?? null,
+    }));
 }
 
 function escapeHtml(value) {
-  return safeString(value)
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#039;');
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }
 
-function unique(values) {
-  return [...new Set(
-    values
-      .filter(value => value != null)
-      .map(value => String(value))
-  )];
-}
-
-// ------------------------------------------------------------
-// VALUE CHECKING
-// ------------------------------------------------------------
-
-function isActiveValue(value) {
-  if (value === true) return true;
-
-  if (typeof value === 'number') {
-    return value === 1;
-  }
-
-  return ACTIVE_VALUES.has(
-    normalize(value)
+function campaignKey(campaign) {
+  return String(
+    campaign?.id ||
+    `${campaign?.name || 'unknown'}:${campaign?.starts_at || ''}:${campaign?.ends_at || ''}`
   );
 }
 
-function looksLikeDropField(path) {
-  const parts = String(path)
-    .toLowerCase()
-    .split(/[.[\]_ -]+/)
-    .filter(Boolean);
+function campaignTitle(campaign) {
+  return campaign?.name || 'Unnamed Kick Drop';
+}
 
-  return parts.some(part =>
-    DROP_FIELD_NAMES.has(part)
+function buildCampaignBlock(campaign, status) {
+  const name = escapeHtml(campaignTitle(campaign));
+  const organization = escapeHtml(
+    campaign?.organization?.name || 'Unknown organization'
   );
+
+  const rewards = getRewards(campaign);
+  const channels = getChannels(campaign);
+
+  const rewardText = rewards.length
+    ? rewards.map(reward => {
+        const units = reward.requiredUnits != null
+          ? ` — ${escapeHtml(reward.requiredUnits)} units`
+          : '';
+
+        return `🎁 ${escapeHtml(reward.name)}${units}`;
+      }).join('\n')
+    : '🎁 Reward information unavailable';
+
+  const channelText = channels.length
+    ? channels
+        .slice(0, MAX_CHANNELS_PER_CAMPAIGN)
+        .map(channel => `• <code>${escapeHtml(channel.slug)}</code>`)
+        .join('\n') +
+      (channels.length > MAX_CHANNELS_PER_CAMPAIGN
+        ? `\n• +${channels.length - MAX_CHANNELS_PER_CAMPAIGN} more`
+        : '')
+    : '• No channels listed';
+
+  const rule = campaign?.rule?.name || 'Unknown';
+
+  let statusIcon = 'ℹ️';
+
+  if (status === 'active') statusIcon = '🟢';
+  if (status === 'upcoming') statusIcon = '🟡';
+  if (status === 'expired') statusIcon = '⚫';
+
+  return [
+    `${statusIcon} <b>${name}</b>`,
+    `🏢 ${organization}`,
+    `📌 Status: <b>${status.toUpperCase()}</b>`,
+    `⏱ Starts: <code>${formatDate(campaign?.starts_at)}</code>`,
+    `⏳ Ends: <code>${formatDate(campaign?.ends_at)}</code>`,
+    `📜 Rule: <b>${escapeHtml(rule)}</b>`,
+    '',
+    '<b>Rewards</b>',
+    rewardText,
+    '',
+    '<b>Eligible channels</b>',
+    channelText,
+    campaign?.url
+      ? `\n🔗 <a href="${escapeHtml(campaign.url)}">Campaign link</a>`
+      : '',
+  ].join('\n');
 }
 
-// ------------------------------------------------------------
-// SAFE OBJECT WALKER
-// ------------------------------------------------------------
+function sortCampaigns(campaigns) {
+  return [...campaigns].sort((a, b) => {
+    const aStart = safeDate(a?.starts_at)?.getTime() ?? Infinity;
+    const bStart = safeDate(b?.starts_at)?.getTime() ?? Infinity;
 
-function collectSignals(
-  value,
-  path = '',
-  output = [],
-  depth = 0
-) {
-  if (
-    value == null ||
-    depth > 6
-  ) {
-    return output;
-  }
-
-  if (
-    typeof value === 'string' ||
-    typeof value === 'number' ||
-    typeof value === 'boolean'
-  ) {
-    output.push({
-      path,
-      value,
-    });
-
-    return output;
-  }
-
-  if (Array.isArray(value)) {
-    for (
-      let i = 0;
-      i < value.length;
-      i++
-    ) {
-      collectSignals(
-        value[i],
-        `${path}[${i}]`,
-        output,
-        depth + 1
-      );
-    }
-
-    return output;
-  }
-
-  if (typeof value === 'object') {
-    for (
-      const [key, child]
-      of Object.entries(value)
-    ) {
-      const nextPath =
-        path
-          ? `${path}.${key}`
-          : key;
-
-      collectSignals(
-        child,
-        nextPath,
-        output,
-        depth + 1
-      );
-    }
-  }
-
-  return output;
+    return aStart - bStart;
+  });
 }
 
-// ============================================================
-// LOCAL DROP SIGNAL SCANNER
-// ============================================================
+function normalizeCampaigns(payload) {
+  if (!payload) return [];
 
-export function scanDropSignals(
-  info,
-  livestream
-) {
-  const source = {
-    channel: info || null,
-    livestream: livestream || null,
-  };
+  if (Array.isArray(payload)) return payload;
 
-  const entries =
-    collectSignals(source);
+  if (Array.isArray(payload.data)) return payload.data;
 
-  const reasons = [];
+  if (Array.isArray(payload.campaigns)) return payload.campaigns;
 
-  for (const entry of entries) {
-    const path =
-      String(entry.path || '');
-
-    const value =
-      entry.value;
-
-    /*
-     * Strongest signal:
-     *
-     * drop_active: true
-     * drops_enabled: true
-     * rewards_active: true
-     * etc.
-     */
-    if (
-      looksLikeDropField(path) &&
-      isActiveValue(value)
-    ) {
-      reasons.push({
-        type: 'explicit',
-        path,
-        value: safeString(value),
-        weight: 10,
-      });
-
-      continue;
-    }
-
-    /*
-     * Arrays/objects under known drop fields are useful
-     * evidence, but are NOT automatically considered proof.
-     */
-    if (
-      looksLikeDropField(path) &&
-      (
-        typeof value === 'string' ||
-        typeof value === 'number'
-      )
-    ) {
-      const normalized =
-        normalize(value);
-
-      if (
-        normalized &&
-        normalized !== 'false' &&
-        normalized !== '0' &&
-        normalized !== 'null' &&
-        normalized !== 'undefined'
-      ) {
-        reasons.push({
-          type: 'drop_field',
-          path,
-          value: safeString(value),
-          weight: 4,
-        });
-      }
-    }
+  if (Array.isArray(payload.data?.campaigns)) {
+    return payload.data.campaigns;
   }
 
-  /*
-   * Only explicit signals are considered a positive match.
-   *
-   * This prevents titles such as:
-   *
-   * "Drop some kills"
-   * "Big reward tonight"
-   *
-   * from generating fake alerts.
-   */
-  const explicit =
-    reasons.filter(
-      reason =>
-        reason.type === 'explicit'
-    );
-
-  let confidence = 'none';
-
-  if (explicit.length >= 2) {
-    confidence = 'high';
-  } else if (explicit.length === 1) {
-    confidence = 'high';
-  } else if (reasons.length) {
-    confidence = 'low';
-  }
-
-  const score =
-    reasons.reduce(
-      (total, reason) =>
-        total + reason.weight,
-      0
-    );
-
-  return {
-    matched: explicit.length > 0,
-    score,
-    confidence,
-    reasons,
-  };
+  return [];
 }
 
-// ============================================================
-// CAMPAIGN HELPERS
-// ============================================================
+async function getCachedCampaigns(env) {
+  const cacheKey = 'kickdrops:campaigns';
 
-function getCampaignId(
-  campaign
-) {
-  return (
-    campaign?.id ??
-    campaign?.campaign_id ??
-    null
-  );
-}
-
-function getCampaignName(
-  campaign
-) {
-  return (
-    campaign?.name ||
-    campaign?.title ||
-    'KICK Drop'
-  );
-}
-
-function getCampaignStart(
-  campaign
-) {
-  return (
-    campaign?.starts_at ||
-    campaign?.start_at ||
-    null
-  );
-}
-
-function getCampaignEnd(
-  campaign
-) {
-  return (
-    campaign?.ends_at ||
-    campaign?.end_at ||
-    null
-  );
-}
-
-function campaignIsActive(
-  campaign,
-  now = Date.now()
-) {
-  const end =
-    getCampaignEnd(campaign);
-
-  if (end) {
-    const endMs =
-      new Date(end).getTime();
-
-    if (
-      Number.isFinite(endMs) &&
-      now >= endMs
-    ) {
-      return false;
-    }
-  }
-
-  const start =
-    getCampaignStart(campaign);
-
-  if (start) {
-    const startMs =
-      new Date(start).getTime();
-
-    if (
-      Number.isFinite(startMs) &&
-      now < startMs
-    ) {
-      return false;
-    }
-  }
-
-  if (
-    campaign?.is_active === false
-  ) {
-    return false;
-  }
-
-  if (
-    normalize(campaign?.status) ===
-    'expired'
-  ) {
-    return false;
-  }
-
-  return true;
-}
-
-// ============================================================
-// CAMPAIGN / CHANNEL CORRELATION
-// ============================================================
-
-function getCampaignChannels(
-  campaign
-) {
-  const channels = [];
-
-  if (
-    Array.isArray(
-      campaign?.channels
-    )
-  ) {
-    channels.push(
-      ...campaign.channels
-    );
-  }
-
-  if (
-    Array.isArray(
-      campaign?.channel_ids
-    )
-  ) {
-    channels.push(
-      ...campaign.channel_ids.map(
-        id => ({ id })
-      )
-    );
-  }
-
-  if (
-    Array.isArray(
-      campaign?.channel_slugs
-    )
-  ) {
-    channels.push(
-      ...campaign.channel_slugs.map(
-        slug => ({ slug })
-      )
-    );
-  }
-
-  return channels;
-}
-
-function campaignMatchesChannel(
-  campaign,
-  channel
-) {
-  if (
-    !campaign ||
-    !channel
-  ) {
-    return false;
-  }
-
-  const trackedSlug =
-    normalize(channel.slug);
-
-  const trackedId =
-    normalize(channel.id);
-
-  const trackedBroadcasterId =
-    normalize(
-      channel.broadcaster_user_id
-    );
-
-  for (
-    const candidate
-    of getCampaignChannels(
-      campaign
-    )
-  ) {
-    const candidateSlug =
-      normalize(
-        candidate?.slug
-      );
-
-    const candidateUsername =
-      normalize(
-        candidate?.username ||
-        candidate?.user?.username
-      );
-
-    const candidateId =
-      normalize(
-        candidate?.id
-      );
-
-    const candidateUserId =
-      normalize(
-        candidate?.userId ||
-        candidate?.user?.id
-      );
-
-    if (
-      trackedSlug &&
-      (
-        candidateSlug === trackedSlug ||
-        candidateUsername === trackedSlug
-      )
-    ) {
-      return true;
-    }
-
-    if (
-      trackedId &&
-      candidateId === trackedId
-    ) {
-      return true;
-    }
-
-    if (
-      trackedBroadcasterId &&
-      (
-        candidateId ===
-          trackedBroadcasterId ||
-        candidateUserId ===
-          trackedBroadcasterId
-      )
-    ) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-// ============================================================
-// DROP MESSAGE
-// ============================================================
-
-function buildDropAlertText({
-  channel,
-  livestream,
-  campaign,
-  report,
-}) {
-  const name =
-    channel?.name ||
-    channel?.slug ||
-    'Streamer';
-
-  const title =
-    livestream?.session_title ||
-    'Live stream';
-
-  const viewers =
-    Number(
-      livestream?.viewer_count
-    );
-
-  const category =
-    livestream
-      ?.categories?.[0]?.name ||
-    'N/A';
-
-  const campaignName =
-    campaign
-      ? getCampaignName(campaign)
-      : 'Active Drop';
-
-  const campaignId =
-    campaign
-      ? getCampaignId(campaign)
-      : null;
-
-  const reasons =
-    report?.reasons
-      ?.slice(0, 3)
-      .map(
-        reason =>
-          reason.path
-      )
-      .join(', ');
-
-  const kickUrl =
-    channel?.slug
-      ? `https://kick.com/${encodeURIComponent(
-          channel.slug
-        )}`
-      : 'https://kick.com';
-
-  return (
-    `🎁 <b>STA/KICK DROP ALERT</b>\n` +
-    `━━━━━━━━━━━━━━\n` +
-    `📛 <b>${escapeHtml(
-      campaignName
-    )}</b>\n` +
-    `🔴 ${escapeHtml(
-      name
-    )} is LIVE\n` +
-    `📺 ${escapeHtml(
-      title
-    )}\n` +
-    `👁 ${
-      Number.isFinite(viewers)
-        ? viewers.toLocaleString()
-        : '?'
-    } viewers\n` +
-    `🎮 ${escapeHtml(
-      category
-    )}\n` +
-    (
-      campaignId
-        ? `🆔 ${escapeHtml(
-            campaignId
-          )}\n`
-        : ''
-    ) +
-    (
-      reasons
-        ? `🧠 Signal: ${escapeHtml(
-            reasons
-          )}\n`
-        : ''
-    ) +
-    `\n⚡ <b>OPEN KICK NOW</b>\n` +
-    `🔗 ${escapeHtml(
-      kickUrl
-    )}\n\n` +
-    `<i>Drop detection is based on explicit KICK/API signals. ` +
-    `You still need to watch the stream to qualify.</i>`
-  );
-}
-
-// ============================================================
-// KV DEDUPLICATION
-// ============================================================
-
-async function wasAlerted(
-  env,
-  key
-) {
   try {
-    return Boolean(
-      await env.KV.get(key)
-    );
-  } catch {
-    return false;
+    const cached = await env?.KV?.get(cacheKey, 'json');
+
+    if (Array.isArray(cached)) {
+      return cached;
+    }
+  } catch (error) {
+    console.error('Kick drops KV read failed:', error);
   }
+
+  return null;
 }
 
-async function markAlerted(
-  env,
-  key,
-  ttl = 86400
-) {
+async function cacheCampaigns(env, campaigns) {
+  if (!env?.KV) return;
+
   try {
     await env.KV.put(
-      key,
-      '1',
+      'kickdrops:campaigns',
+      JSON.stringify(campaigns),
       {
-        expirationTtl: ttl,
+        expirationTtl: DROP_CHECK_TTL,
       }
     );
   } catch (error) {
-    console.error(
-      'markAlerted failed:',
-      error?.message || error
-    );
+    console.error('Kick drops KV write failed:', error);
   }
 }
 
-// ============================================================
-// D1 RECORDING
-// ============================================================
+async function loadCampaigns(env, forceRefresh = false) {
+  if (!forceRefresh) {
+    const cached = await getCachedCampaigns(env);
 
-async function recordDrop(
-  env,
-  {
-    channel,
-    livestream,
-    campaign,
-    chatId,
-  }
-) {
-  try {
-    await env.DB.prepare(
-      `INSERT INTO kick_drops
-       (
-         channel_slug,
-         stream_id,
-         title,
-         detected_at,
-         chat_id
-       )
-       VALUES (?, ?, ?, ?, ?)`
-    )
-      .bind(
-        channel?.slug || null,
-        String(
-          livestream?.id ||
-          `${channel?.slug || 'unknown'}:${livestream?.session_title || 'unknown'}`
-        ),
-        livestream?.session_title ||
-          campaign?.name ||
-          null,
-        Date.now(),
-        chatId
-      )
-      .run();
-  } catch (error) {
-    /*
-     * Recording failure should NEVER prevent the Telegram
-     * notification from being sent.
-     */
-    console.error(
-      'recordDrop failed:',
-      error?.message || error
-    );
-  }
-}
-
-// ============================================================
-// PUBLIC DETECTOR
-// ============================================================
-
-export async function detectDrops(
-  env,
-  chatId,
-  channel,
-  livestream,
-  campaigns = []
-) {
-  /*
-   * No live stream = nothing to detect locally.
-   */
-  if (!livestream) {
-    return {
-      matched: false,
-      reason: 'not_live',
-    };
-  }
-
-  /*
-   * ----------------------------------------------------------
-   * 1. PRIMARY LOCAL SIGNAL
-   * ----------------------------------------------------------
-   *
-   * Look for explicit drop fields in the channel/livestream
-   * response.
-   */
-  const report =
-    scanDropSignals(
-      channel,
-      livestream
-    );
-
-  /*
-   * ----------------------------------------------------------
-   * 2. PRIMARY API CAMPAIGN CORRELATION
-   * ----------------------------------------------------------
-   *
-   * If monitor.js supplied campaigns, use them.
-   *
-   * This is MUCH stronger than title/text guessing.
-   */
-  let matchedCampaign = null;
-
-  if (
-    Array.isArray(campaigns) &&
-    campaigns.length
-  ) {
-    for (
-      const campaign
-      of campaigns
-    ) {
-      if (
-        !campaignIsActive(
-          campaign
-        )
-      ) {
-        continue;
-      }
-
-      if (
-        campaignMatchesChannel(
-          campaign,
-          channel
-        )
-      ) {
-        matchedCampaign =
-          campaign;
-        break;
-      }
+    if (cached) {
+      return {
+        campaigns: cached,
+        cached: true,
+      };
     }
   }
 
-  /*
-   * ----------------------------------------------------------
-   * 3. No reliable signal
-   * ----------------------------------------------------------
-   */
-  if (
-    !matchedCampaign &&
-    !report.matched
-  ) {
+  const payload = await fetchDropCampaigns(env);
+  const campaigns = normalizeCampaigns(payload);
+
+  if (!campaigns.length) {
     return {
-      matched: false,
-      report,
-      campaign: null,
+      campaigns: [],
+      cached: false,
     };
   }
 
-  /*
-   * ----------------------------------------------------------
-   * 4. Build a stable deduplication key
-   * ----------------------------------------------------------
-   */
-  const campaignId =
-    matchedCampaign
-      ? getCampaignId(
-          matchedCampaign
-        )
-      : null;
+  await cacheCampaigns(env, campaigns);
 
-  const streamId =
-    livestream?.id ||
-    `${channel?.slug || 'unknown'}:${livestream?.session_title || 'unknown'}`;
+  return {
+    campaigns,
+    cached: false,
+  };
+}
 
-  const alertKey =
-    campaignId
-      ? `drop_alert:local:${campaignId}:${channel?.slug || 'unknown'}`
-      : `drop_alert:local:${channel?.slug || 'unknown'}:${streamId}`;
+function splitCampaigns(campaigns) {
+  const now = Date.now();
 
-  /*
-   * Do NOT use a 30-minute cooldown.
-   *
-   * A campaign ID is the correct identity when available.
-   */
-  if (
-    await wasAlerted(
-      env,
-      alertKey
-    )
-  ) {
-    return {
-      matched: true,
-      alreadyAlerted: true,
-      report,
-      campaign: matchedCampaign,
-    };
+  const active = [];
+  const upcoming = [];
+  const expired = [];
+
+  for (const campaign of campaigns) {
+    const status = getCampaignStatus(campaign, now);
+
+    if (status === 'active') {
+      active.push(campaign);
+    } else if (status === 'upcoming') {
+      upcoming.push(campaign);
+    } else if (status === 'expired') {
+      expired.push(campaign);
+    }
   }
 
-  /*
-   * ----------------------------------------------------------
-   * 5. Send notification
-   * ----------------------------------------------------------
-   */
-  if (!chatId) {
-    return {
-      matched: true,
-      notified: false,
-      reason: 'missing_chat_id',
-      report,
-      campaign: matchedCampaign,
-    };
+  return {
+    active: sortCampaigns(active),
+    upcoming: sortCampaigns(upcoming),
+    expired: sortCampaigns(expired),
+  };
+}
+
+function buildHeader(source, counts) {
+  const sourceText = source === 'cache'
+    ? 'cached API data'
+    : 'live Kick Drops API';
+
+  return [
+    '🎁 <b>KICK DROPS</b>',
+    '',
+    `📡 Source: <b>${sourceText}</b>`,
+    `🟢 Active: <b>${counts.active}</b>`,
+    `🟡 Upcoming: <b>${counts.upcoming}</b>`,
+    `⚫ Expired: <b>${counts.expired}</b>`,
+  ].join('\n');
+}
+
+function buildSection(title, campaigns) {
+  if (!campaigns.length) {
+    return `${title}\n<i>None found.</i>`;
   }
 
-  const text =
-    buildDropAlertText({
-      channel,
-      livestream,
-      campaign:
-        matchedCampaign,
-      report,
+  const limited = campaigns.slice(0, MAX_CAMPAIGNS);
+
+  return [
+    title,
+    '',
+    limited.map(campaign => {
+      const status = getCampaignStatus(campaign);
+      return buildCampaignBlock(campaign, status);
+    }).join('\n\n━━━━━━━━━━━━━━\n\n'),
+  ].join('\n');
+}
+
+function buildMessage(campaigns, source) {
+  const groups = splitCampaigns(campaigns);
+
+  const header = buildHeader(source, {
+    active: groups.active.length,
+    upcoming: groups.upcoming.length,
+    expired: groups.expired.length,
+  });
+
+  const sections = [];
+
+  if (groups.active.length) {
+    sections.push(
+      buildSection(
+        '🟢 <b>ACTIVE NOW</b>',
+        groups.active
+      )
+    );
+  }
+
+  if (groups.upcoming.length) {
+    sections.push(
+      buildSection(
+        '🟡 <b>UPCOMING</b>',
+        groups.upcoming
+      )
+    );
+  }
+
+  if (groups.expired.length) {
+    sections.push(
+      buildSection(
+        '⚫ <b>PREVIOUS / EXPIRED</b>',
+        groups.expired
+      )
+    );
+  }
+
+  if (!sections.length) {
+    return `${header}\n\n❌ No Kick Drop campaigns were returned by the API.`;
+  }
+
+  return `${header}\n\n${sections.join('\n\n━━━━━━━━━━━━━━━━\n\n')}`;
+}
+
+async function sendLongMessage(env, chatId, text) {
+  const MAX_LENGTH = 3900;
+
+  if (text.length <= MAX_LENGTH) {
+    await tg.sendMessage(env.BOT_TOKEN, chatId, text, {
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
     });
 
+    return;
+  }
+
+  let remaining = text;
+
+  while (remaining.length > MAX_LENGTH) {
+    let splitAt = remaining.lastIndexOf('\n\n', MAX_LENGTH);
+
+    if (splitAt < 1000) {
+      splitAt = remaining.lastIndexOf('\n', MAX_LENGTH);
+    }
+
+    if (splitAt < 500) {
+      splitAt = MAX_LENGTH;
+    }
+
+    const chunk = remaining.slice(0, splitAt);
+
+    await tg.sendMessage(env.BOT_TOKEN, chatId, chunk, {
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+    });
+
+    remaining = remaining.slice(splitAt).trimStart();
+  }
+
+  if (remaining) {
+    await tg.sendMessage(env.BOT_TOKEN, chatId, remaining, {
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+    });
+  }
+}
+
+/**
+ * Main /kickdrops command.
+ *
+ * Shows real Kick Drops campaigns globally.
+ *
+ * It does NOT:
+ * - inspect stream titles
+ * - guess from words like "bonus"
+ * - depend on tracked streamers
+ * - require a channel to be in the bot's tracking list
+ *
+ * It DOES:
+ * - query Kick's Drops campaigns endpoint through fetchDropCampaigns()
+ * - show active campaigns
+ * - show upcoming campaigns
+ * - show previous/expired campaigns
+ * - show exact starts_at / ends_at
+ * - show rewards
+ * - show watch-to-redeem rules
+ * - show eligible channels
+ */
+export async function kickdrops(env, chatId) {
+  if (!env?.BOT_TOKEN) {
+    throw new Error('BOT_TOKEN is missing');
+  }
+
+  if (!chatId) {
+    throw new Error('Telegram chat ID is missing');
+  }
+
   try {
+    const result = await loadCampaigns(env, true);
+
+    const campaigns = result.campaigns;
+
+    if (!campaigns.length) {
+      await tg.sendMessage(
+        env.BOT_TOKEN,
+        chatId,
+        [
+          '🎁 <b>KICK DROPS</b>',
+          '',
+          '⚠️ Kick returned no campaign objects.',
+          '',
+          'The bot did not guess or infer a drop.',
+          'It only reports campaigns returned by the real Kick Drops API.',
+          '',
+          '🔄 Try <code>/kickdrops</code> again shortly.',
+        ].join('\n'),
+        {
+          parse_mode: 'HTML',
+          disable_web_page_preview: true,
+        }
+      );
+
+      return {
+        ok: true,
+        count: 0,
+      };
+    }
+
+    const text = buildMessage(campaigns, result.cached ? 'cache' : 'api');
+
+    await sendLongMessage(env, chatId, text);
+
+    return {
+      ok: true,
+      count: campaigns.length,
+      active: splitCampaigns(campaigns).active.length,
+      upcoming: splitCampaigns(campaigns).upcoming.length,
+      expired: splitCampaigns(campaigns).expired.length,
+    };
+  } catch (error) {
+    console.error('kickdrops command failed:', error);
+
     await tg.sendMessage(
       env.BOT_TOKEN,
       chatId,
-      text,
+      [
+        '❌ <b>Kick Drops check failed</b>',
+        '',
+        'The bot could not read the Kick Drops campaigns API.',
+        '',
+        `<code>${escapeHtml(error?.message || 'Unknown error')}</code>`,
+        '',
+        '🔄 Try <code>/kickdrops</code> again.',
+      ].join('\n'),
       {
         parse_mode: 'HTML',
-        disable_web_page_preview: false,
+        disable_web_page_preview: true,
       }
     );
-  } catch (error) {
-    console.error(
-      'DROP TELEGRAM ALERT FAILED:',
-      error?.message || error
-    );
 
-    /*
-     * Do not mark the alert as sent if Telegram failed.
-     * The next monitor invocation can retry.
-     */
     return {
-      matched: true,
-      notified: false,
-      report,
-      campaign: matchedCampaign,
-      error: error?.message || String(error),
+      ok: false,
+      error: error?.message || 'Unknown error',
     };
   }
-
-  /*
-   * ----------------------------------------------------------
-   * 6. Mark AFTER successful Telegram delivery
-   * ----------------------------------------------------------
-   */
-  await markAlerted(
-    env,
-    alertKey,
-    7 * 24 * 60 * 60
-  );
-
-  /*
-   * ----------------------------------------------------------
-   * 7. Record in D1
-   * ----------------------------------------------------------
-   */
-  await recordDrop(
-    env,
-    {
-      channel,
-      livestream,
-      campaign:
-        matchedCampaign,
-      chatId,
-    }
-  );
-
-  return {
-    matched: true,
-    notified: true,
-    report,
-    campaign: matchedCampaign,
-  };
 }
 
-// ============================================================
-// API-COMPATIBILITY ALIAS
-// ============================================================
-//
-// If older code imports detectDrop instead of detectDrops,
-// this keeps that code working.
-//
-// ============================================================
-
-export const detectDrop =
-  detectDrops;
+/**
+ * Optional aliases so existing command routers can use
+ * whichever name they already expect.
+ */
+export const handleKickDrops = kickdrops;
+export const handleKickdrops = kickdrops;
+export default kickdrops;
