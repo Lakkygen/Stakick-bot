@@ -1,4 +1,5 @@
 import { tg } from '../telegram';
+import { fetchDropCampaigns } from './api';
 
 // ============================================================
 // STAKICK DROP + STREAM MONITOR
@@ -358,90 +359,17 @@ function isActive(
 // ============================================================
 
 async function fetchDrops(env) {
-  const controller =
-    new AbortController();
-
-  const timeout =
-    setTimeout(
-      () => controller.abort(),
-      DROP_TIMEOUT_MS
-    );
-
   try {
-    const headers = {
-      'User-Agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      Accept:
-        'application/json',
-      'Cache-Control':
-        'no-cache, no-store, max-age=0',
-      Pragma:
-        'no-cache'
-    };
+    const campaigns =
+      await fetchDropCampaigns(env);
 
-    if (
-      env.KICK_SESSION_TOKEN
-    ) {
-      headers.Authorization =
-        `Bearer ${env.KICK_SESSION_TOKEN}`;
-    }
-
-    const response =
-      await fetch(
-        DROP_API_URL,
-        {
-          method: 'GET',
-          headers,
-          signal:
-            controller.signal,
-          cf: {
-            cacheTtl: 0,
-            cacheEverything: false
-          }
-        }
+    if (campaigns === null) {
+      console.error(
+        '[DROPS API] unavailable'
       );
 
-    if (!response.ok) {
-      throw new Error(
-        `Drops API returned HTTP ${response.status}`
-      );
+      return null;
     }
-
-    const payload =
-      await response.json();
-
-    let campaigns = [];
-
-    if (
-      Array.isArray(payload)
-    ) {
-      campaigns =
-        payload;
-    } else if (
-      Array.isArray(
-        payload?.data
-      )
-    ) {
-      campaigns =
-        payload.data;
-    } else if (
-      Array.isArray(
-        payload?.campaigns
-      )
-    ) {
-      campaigns =
-        payload.campaigns;
-    } else if (
-      Array.isArray(
-        payload?.data?.campaigns
-      )
-    ) {
-      campaigns =
-        payload.data.campaigns;
-    }
-
-    campaigns =
-      campaigns.filter(Boolean);
 
     console.log(
       `[DROPS API] received ${campaigns.length} campaign(s)`
@@ -452,15 +380,11 @@ async function fetchDrops(env) {
   } catch (error) {
     console.error(
       '[DROPS API] FAILED:',
-      error?.name === 'AbortError'
-        ? `timeout after ${DROP_TIMEOUT_MS}ms`
-        : error?.message || error
+      error?.message || error
     );
 
     return null;
 
-  } finally {
-    clearTimeout(timeout);
   }
 }
 
@@ -771,44 +695,81 @@ function matchedChannels(
 // TARGET CHATS
 // ============================================================
 
-function getTargets(
+async function getTargets(
+  env,
   matched,
   allTracked
 ) {
-  const matchedTargets =
-    unique(
-      matched
-        .map(
-          channel =>
-            channel?.notify_chat_id
-        )
-        .filter(Boolean)
-    );
+  const targets = new Set();
 
-  if (
-    matchedTargets.length
+  for (
+    const channel
+    of matched
   ) {
-    return matchedTargets;
+    if (
+      channel?.notify_chat_id
+    ) {
+      targets.add(
+        String(
+          channel.notify_chat_id
+        )
+      );
+    }
   }
 
   /*
-   * If the campaign has no recognizable channel
-   * association, don't silently lose the drop.
-   *
-   * Send it to the configured tracked notification
-   * chats.
-   */
-  const fallbackTargets =
-    unique(
-      allTracked
-        .map(
-          channel =>
-            channel?.notify_chat_id
-        )
-        .filter(Boolean)
-    );
 
-  return fallbackTargets;
+   Always include the configured default notification group.
+
+   This allows global KICK Drops to be announced even when
+
+   the campaign does not expose a recognizable channel match.
+  */
+  try {
+    const defaultGroup =
+      await env.KV.get(
+        'default_notify_group'
+      );
+
+
+    if (defaultGroup) {
+      targets.add(
+        String(defaultGroup)
+      );
+    }
+
+  } catch (error) {
+    console.error(
+      '[DROP TARGET] KV error:',
+      error?.message || error
+    );
+  }
+
+  /*
+
+   Last-resort fallback for existing watched channels.
+  */
+  if (!targets.size) {
+    for (
+      const channel
+      of allTracked
+    ) {
+      if (
+        channel?.notify_chat_id
+      ) {
+        targets.add(
+          String(
+            channel.notify_chat_id
+          )
+        );
+      }
+    }
+  }
+
+
+  return [
+    ...targets
+  ];
 }
 
 
@@ -1092,7 +1053,8 @@ async function sendDropAlert({
   }
 
   const targets =
-    getTargets(
+    await getTargets(
+      env,
       matched,
       allTracked
     );
