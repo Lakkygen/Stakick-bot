@@ -1,4 +1,4 @@
-import { tg } from './telegram';
+import { tg } from '../telegram';
 
 // ============================================================
 // STAKICK DROP DETECTOR
