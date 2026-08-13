@@ -1,0 +1,19 @@
+{
+  "name": "stakick-browser-watcher",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Stakick browser helper for opening detected Kick streams in a persistent browser profile.",
+  "scripts": {
+    "start": "node watcher.js",
+    "check": "node --check watcher.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.1",
+    "express": "^5.1.0",
+    "playwright": "^1.55.0"
+  }
+}
