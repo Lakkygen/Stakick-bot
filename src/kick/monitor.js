@@ -1,5 +1,6 @@
 import { tg } from '../telegram';
 import { fetchDropCampaigns } from './api';
+import { startWatcher } from './watcher';
 
 // ============================================================
 // STAKICK DROP + STREAM MONITOR
