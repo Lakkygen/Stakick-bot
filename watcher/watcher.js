@@ -10,69 +10,45 @@ const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '32kb' }));
 
-// ============================================================
-// CONFIG
-// ============================================================
+const PORT =
+  Number(process.env.PORT || 3000);
 
-const PORT = getPositiveInteger(
-  process.env.PORT,
-  3000
-);
-
-const PROFILE_PATH = path.resolve(
-  process.env.KICK_PROFILE || './kick-profile'
-);
+const PROFILE_PATH =
+  path.resolve(
+    process.env.KICK_PROFILE ||
+      './kick-profile'
+  );
 
 const WATCHER_SECRET =
-  process.env.WATCHER_SECRET || '';
+  String(
+    process.env.WATCHER_SECRET || ''
+  ).trim();
 
 const MAX_PAGES = Math.min(
-  getPositiveInteger(
-    process.env.MAX_PAGES,
-    3
+  Math.max(
+    Number(process.env.MAX_PAGES || 3),
+    1
   ),
-  10
+  5
 );
 
-const NAVIGATION_TIMEOUT_MS = Math.min(
-  getPositiveInteger(
-    process.env.NAVIGATION_TIMEOUT_MS,
-    30000
-  ),
-  120000
-);
-
-const KICK_BASE_URL =
-  'https://kick.com';
-
-// ============================================================
-// STATE
-// ============================================================
-
-let browserContext = null;
-let browserStarting = null;
-let shuttingDown = false;
+const NAVIGATION_TIMEOUT_MS =
+  Math.min(
+    Math.max(
+      Number(
+        process.env.NAVIGATION_TIMEOUT_MS ||
+          30000
+      ),
+      5000
+    ),
+    120000
+  );
 
 const pages = new Map();
 
-let requestCount = 0;
-
-// ============================================================
-// HELPERS
-// ============================================================
-
-function getPositiveInteger(value, fallback) {
-  const number = Number(value);
-
-  if (
-    Number.isInteger(number) &&
-    number > 0
-  ) {
-    return number;
-  }
-
-  return fallback;
-}
+let context = null;
+let startupPromise = null;
+let shuttingDown = false;
 
 function log(...args) {
   console.log(
@@ -88,35 +64,18 @@ function errorLog(...args) {
   );
 }
 
-function ensureDirectory(directory) {
-  fs.mkdirSync(directory, {
-    recursive: true
-  });
-}
+function validSlug(value) {
+  if (!value) return null;
 
-function normalizeSlug(value) {
-  if (
-    typeof value !== 'string'
-  ) {
-    return null;
-  }
+  let slug = String(value).trim();
 
-  let slug = value.trim();
-
-  if (!slug) {
-    return null;
-  }
-
-  // Accept either:
-  // xQc
-  // https://kick.com/xQc
-  // https://www.kick.com/xQc
   try {
     if (
       slug.startsWith('http://') ||
       slug.startsWith('https://')
     ) {
-      const url = new URL(slug);
+      const url =
+        new URL(slug);
 
       if (
         url.hostname !== 'kick.com' &&
@@ -134,14 +93,11 @@ function normalizeSlug(value) {
     return null;
   }
 
-  slug = slug
-    .replace(/^@/, '')
-    .trim();
+  slug =
+    slug
+      .replace(/^@/, '')
+      .trim();
 
-  /*
-   * Kick channel slugs should not contain
-   * whitespace or URL path separators.
-   */
   if (
     !/^[a-zA-Z0-9_.-]{1,100}$/.test(
       slug
@@ -153,209 +109,110 @@ function normalizeSlug(value) {
   return slug;
 }
 
-function streamUrl(slug) {
-  return `${KICK_BASE_URL}/${encodeURIComponent(
-    slug
-  )}`;
-}
-
 function authorized(req) {
   if (!WATCHER_SECRET) {
-    return true;
+    return false;
   }
 
-  const supplied =
-    req.get('x-watcher-secret') ||
-    req.body?.secret ||
-    '';
-
-  return supplied === WATCHER_SECRET;
+  return (
+    req.get('x-watcher-secret') ===
+    WATCHER_SECRET
+  );
 }
 
-function activePages() {
-  return [...pages.values()]
-    .filter(
-      entry =>
-        entry.page &&
-        !entry.page.isClosed()
-    );
-}
-
-function pageAlreadyOpen(slug) {
-  for (const entry of activePages()) {
-    if (
-      entry.slug.toLowerCase() ===
-      slug.toLowerCase()
-    ) {
-      return entry;
-    }
-  }
-
-  return null;
-}
-
-// ============================================================
-// BROWSER
-// ============================================================
-
-async function launchBrowser() {
+async function ensureBrowser() {
   if (shuttingDown) {
     throw new Error(
-      'Watcher is shutting down.'
+      'Watcher is shutting down'
     );
   }
 
-  if (browserContext) {
-    return browserContext;
+  if (context) {
+    return context;
   }
 
-  if (browserStarting) {
-    return browserStarting;
+  if (startupPromise) {
+    return startupPromise;
   }
 
-  browserStarting =
+  startupPromise =
     (async () => {
-      ensureDirectory(
-        PROFILE_PATH
+      fs.mkdirSync(
+        PROFILE_PATH,
+        {
+          recursive: true
+        }
       );
 
       log(
-        `Starting Chromium with profile: ${PROFILE_PATH}`
+        `Launching Chromium profile: ${PROFILE_PATH}`
       );
 
-      const context =
+      const browser =
         await chromium.launchPersistentContext(
           PROFILE_PATH,
           {
             headless: false,
-
             viewport: {
               width: 1280,
               height: 720
             },
-
-            locale: 'en-US',
-
-            ignoreHTTPSErrors: false,
-
-            timeout:
-              NAVIGATION_TIMEOUT_MS
+            locale: 'en-US'
           }
         );
 
-      context.setDefaultTimeout(
+      browser.setDefaultTimeout(
         15000
       );
 
-      context.setDefaultNavigationTimeout(
+      browser.setDefaultNavigationTimeout(
         NAVIGATION_TIMEOUT_MS
       );
 
-      context.on(
-        'page',
-        page => {
-          log(
-            'Browser opened a new page.'
-          );
-
-          attachPageListeners(
-            page
-          );
-        }
-      );
-
-      context.on(
+      browser.on(
         'close',
         () => {
-          log(
-            'Browser context closed.'
-          );
-
-          browserContext = null;
+          context = null;
         }
       );
 
-      browserContext = context;
-
-      for (
-        const page of context.pages()
-      ) {
-        attachPageListeners(
-          page
-        );
-      }
+      context = browser;
 
       log(
-        'Chromium is ready.'
+        'Chromium ready.'
       );
 
-      return context;
+      return browser;
     })();
 
   try {
-    return await browserStarting;
+    return await startupPromise;
   } finally {
-    browserStarting = null;
+    startupPromise = null;
   }
 }
 
-function attachPageListeners(page) {
-  if (
-    page.__stakickListenersAttached
-  ) {
-    return;
-  }
-
-  page.__stakickListenersAttached =
-    true;
-
-  page.on(
-    'crash',
-    () => {
-      errorLog(
-        'A browser page crashed.'
-      );
-    }
-  );
-
-  page.on(
-    'close',
-    () => {
-      for (
-        const [id, entry]
-        of pages.entries()
-      ) {
-        if (
-          entry.page === page
-        ) {
-          pages.delete(id);
-
-          log(
-            `Removed closed page ${id}.`
-          );
-        }
-      }
-    }
-  );
-
-  page.on(
-    'pageerror',
-    error => {
-      errorLog(
-        'Kick page error:',
-        error.message
-      );
-    }
+function activePages() {
+  return [
+    ...pages.values()
+  ].filter(
+    entry =>
+      entry.page &&
+      !entry.page.isClosed()
   );
 }
 
-// ============================================================
-// OPEN STREAM
-// ============================================================
+function findExisting(slug) {
+  return activePages().find(
+    entry =>
+      entry.slug.toLowerCase() ===
+      slug.toLowerCase()
+  );
+}
 
 async function openStream(slug) {
   const existing =
-    pageAlreadyOpen(slug);
+    findExisting(slug);
 
   if (existing) {
     try {
@@ -363,53 +220,60 @@ async function openStream(slug) {
     } catch {}
 
     return {
+      ok: true,
       reused: true,
       pageId: existing.id,
-      slug,
-      url: streamUrl(slug)
+      slug
     };
   }
 
-  const current =
-    activePages();
-
   if (
-    current.length >=
+    activePages().length >=
     MAX_PAGES
   ) {
     throw new Error(
-      `Maximum active stream pages reached (${MAX_PAGES}).`
+      `Maximum active pages reached (${MAX_PAGES})`
     );
   }
 
-  const context =
-    await launchBrowser();
+  const browser =
+    await ensureBrowser();
 
   const page =
-    await context.newPage();
+    await browser.newPage();
 
-  attachPageListeners(page);
-
-  const id =
+  const pageId =
     `${Date.now()}-${Math.random()
       .toString(36)
       .slice(2, 8)}`;
 
-  pages.set(id, {
-    id,
-    slug,
-    page,
-    openedAt: Date.now()
-  });
+  pages.set(
+    pageId,
+    {
+      id: pageId,
+      slug,
+      page,
+      openedAt: Date.now()
+    }
+  );
 
-  const url =
-    streamUrl(slug);
-
-  log(
-    `Opening Kick stream: ${url}`
+  page.on(
+    'close',
+    () => {
+      pages.delete(pageId);
+    }
   );
 
   try {
+    const url =
+      `https://kick.com/${encodeURIComponent(
+        slug
+      )}`;
+
+    log(
+      `Opening ${url}`
+    );
+
     await page.goto(
       url,
       {
@@ -420,104 +284,43 @@ async function openStream(slug) {
       }
     );
 
-    /*
-     * Give the page a small amount of time
-     * to finish rendering.
-     *
-     * This does NOT attempt to fake viewing
-     * or manipulate Kick's playback system.
-     */
-    await page
-      .waitForTimeout(1000);
-
-    try {
-      await page.bringToFront();
-    } catch {}
-
-    log(
-      `Stream opened successfully: ${slug}`
-    );
+    await page.bringToFront();
 
     return {
+      ok: true,
       reused: false,
-      pageId: id,
+      pageId,
       slug,
-      url,
-      title:
-        await page.title().catch(
-          () => null
-        )
+      url
     };
   } catch (error) {
-    pages.delete(id);
+    pages.delete(
+      pageId
+    );
 
     try {
       await page.close();
     } catch {}
 
-    throw new Error(
-      `Failed to open Kick stream "${slug}": ${error.message}`
-    );
+    throw error;
   }
 }
-
-// ============================================================
-// CLOSE STREAM
-// ============================================================
-
-async function closeStream(pageId) {
-  const entry =
-    pages.get(pageId);
-
-  if (!entry) {
-    return false;
-  }
-
-  pages.delete(pageId);
-
-  try {
-    if (
-      !entry.page.isClosed()
-    ) {
-      await entry.page.close();
-    }
-  } catch (error) {
-    errorLog(
-      `Failed closing page ${pageId}:`,
-      error.message
-    );
-  }
-
-  return true;
-}
-
-// ============================================================
-// ROUTES
-// ============================================================
 
 app.get(
   '/health',
-  async (req, res) => {
-    const active =
-      activePages();
-
+  (req, res) => {
     res.json({
       ok: true,
-      service:
-        'stakick-browser-watcher',
       browserReady:
-        Boolean(browserContext),
-      shuttingDown,
+        Boolean(context),
       activeStreams:
-        active.length,
+        activePages().length,
       maxStreams:
         MAX_PAGES,
-      uptimeSeconds:
+      uptime:
         Math.floor(
           process.uptime()
-        ),
-      timestamp:
-        new Date().toISOString()
+        )
     });
   }
 );
@@ -525,7 +328,14 @@ app.get(
 app.get(
   '/streams',
   (req, res) => {
-    res.json({
+    if (!authorized(req)) {
+      return res.status(401).json({
+        ok: false,
+        error: 'Unauthorized'
+      });
+    }
+
+    return res.json({
       ok: true,
       streams:
         activePages().map(
@@ -535,13 +345,9 @@ app.get(
             slug:
               entry.slug,
             openedAt:
-              new Date(
-                entry.openedAt
-              ).toISOString(),
+              entry.openedAt,
             url:
-              streamUrl(
-                entry.slug
-              )
+              `https://kick.com/${entry.slug}`
           })
         )
     });
@@ -551,54 +357,52 @@ app.get(
 app.post(
   '/watch',
   async (req, res) => {
-    const requestId =
-      ++requestCount;
+    if (!authorized(req)) {
+      return res.status(401).json({
+        ok: false,
+        error: 'Unauthorized'
+      });
+    }
+
+    const slug =
+      validSlug(
+        req.body?.slug
+      );
+
+    if (!slug) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          'Invalid Kick channel slug'
+      });
+    }
 
     try {
-      if (!authorized(req)) {
-        return res.status(401).json({
-          ok: false,
-          error:
-            'Unauthorized.',
-          requestId
-        });
-      }
-
-      const slug =
-        normalizeSlug(
-          req.body?.slug
-        );
-
-      if (!slug) {
-        return res.status(400).json({
-          ok: false,
-          error:
-            'Invalid Kick channel slug.',
-          requestId
-        });
-      }
-
       const result =
         await openStream(
           slug
         );
 
+      log(
+        `[WATCH] ${slug} opened`
+      );
+
       return res.json({
         ok: true,
-        requestId,
         ...result
       });
     } catch (error) {
       errorLog(
-        `[${requestId}] /watch failed:`,
-        error.message
+        `[WATCH] ${slug} failed:`,
+        error?.message ||
+          error
       );
 
       return res.status(500).json({
         ok: false,
-        requestId,
         error:
-          error.message
+          error?.message ||
+          'Failed to open stream'
       });
     }
   }
@@ -607,110 +411,84 @@ app.post(
 app.post(
   '/close',
   async (req, res) => {
-    try {
-      if (!authorized(req)) {
-        return res.status(401).json({
-          ok: false,
-          error:
-            'Unauthorized.'
-        });
-      }
-
-      const pageId =
-        String(
-          req.body?.pageId || ''
-        ).trim();
-
-      if (!pageId) {
-        return res.status(400).json({
-          ok: false,
-          error:
-            'Missing pageId.'
-        });
-      }
-
-      const closed =
-        await closeStream(
-          pageId
-        );
-
-      if (!closed) {
-        return res.status(404).json({
-          ok: false,
-          error:
-            'Stream page not found.'
-        });
-      }
-
-      return res.json({
-        ok: true,
-        closed: true,
-        pageId
-      });
-    } catch (error) {
-      return res.status(500).json({
+    if (!authorized(req)) {
+      return res.status(401).json({
         ok: false,
-        error:
-          error.message
+        error: 'Unauthorized'
       });
     }
+
+    const pageId =
+      String(
+        req.body?.pageId || ''
+      ).trim();
+
+    const entry =
+      pages.get(pageId);
+
+    if (!entry) {
+      return res.status(404).json({
+        ok: false,
+        error:
+          'Page not found'
+      });
+    }
+
+    pages.delete(pageId);
+
+    try {
+      await entry.page.close();
+    } catch {}
+
+    return res.json({
+      ok: true,
+      closed: true,
+      pageId
+    });
   }
 );
-
-// ============================================================
-// 404
-// ============================================================
 
 app.use(
   (req, res) => {
     res.status(404).json({
       ok: false,
       error:
-        'Route not found.',
-      path:
-        req.path
+        'Route not found'
     });
   }
 );
 
-// ============================================================
-// ERROR HANDLER
-// ============================================================
+const server =
+  app.listen(
+    PORT,
+    async () => {
+      log(
+        `Stakick watcher listening on port ${PORT}`
+      );
 
-app.use(
-  (error, req, res, next) => {
-    errorLog(
-      'Express error:',
-      error
-    );
+      try {
+        await ensureBrowser();
 
-    if (
-      res.headersSent
-    ) {
-      return next(error);
+        log(
+          'Watcher ready. Log into Kick in the opened Chromium profile.'
+        );
+      } catch (error) {
+        errorLog(
+          'Browser startup failed:',
+          error?.message ||
+            error
+        );
+      }
     }
+  );
 
-    return res.status(500).json({
-      ok: false,
-      error:
-        'Internal watcher error.'
-    });
-  }
-);
-
-// ============================================================
-// SHUTDOWN
-// ============================================================
-
-async function shutdown(signal) {
-  if (shuttingDown) {
-    return;
-  }
+async function shutdown() {
+  if (shuttingDown) return;
 
   shuttingDown = true;
 
   log(
-    `${signal} received. Shutting down...`
+    'Shutting down watcher...'
   );
 
   for (
@@ -723,137 +501,25 @@ async function shutdown(signal) {
 
   pages.clear();
 
-  if (browserContext) {
+  if (context) {
     try {
-      await browserContext.close();
+      await context.close();
     } catch {}
 
-    browserContext = null;
+    context = null;
   }
 
-  server.close(() => {
-    log(
-      'Watcher stopped cleanly.'
-    );
-
-    process.exit(0);
-  });
-
-  setTimeout(
-    () => {
-      process.exit(1);
-    },
-    5000
-  ).unref();
-}
-
-// ============================================================
-// START
-// ============================================================
-
-ensureDirectory(
-  PROFILE_PATH
-);
-
-const server =
-  app.listen(
-    PORT,
-    async () => {
-      log(
-        `Stakick watcher listening on port ${PORT}`
-      );
-
-      log(
-        `Profile: ${PROFILE_PATH}`
-      );
-
-      log(
-        `Maximum streams: ${MAX_PAGES}`
-      );
-
-      if (
-        WATCHER_SECRET
-      ) {
-        log(
-          'Request authentication: enabled'
-        );
-      } else {
-        log(
-          'WARNING: WATCHER_SECRET is not configured.'
-        );
-      }
-
-      try {
-        await launchBrowser();
-
-        log(
-          'Watcher is ready.'
-        );
-        log(
-          'Open Kick and log into your account manually.'
-        );
-      } catch (error) {
-        errorLog(
-          'Browser startup failed:',
-          error.message
-        );
-
-        /*
-         * The HTTP server stays alive so a temporary
-         * Chromium problem does not kill the service.
-         * A later /watch request will retry browser startup.
-         */
-      }
-    }
+  server.close(
+    () => process.exit(0)
   );
-
-server.on(
-  'error',
-  error => {
-    errorLog(
-      'HTTP server error:',
-      error.message
-    );
-
-    if (
-      error.code ===
-      'EADDRINUSE'
-    ) {
-      errorLog(
-        `Port ${PORT} is already in use.`
-      );
-
-      process.exit(1);
-    }
-  }
-);
+}
 
 process.on(
   'SIGINT',
-  () => shutdown('SIGINT')
+  shutdown
 );
 
 process.on(
   'SIGTERM',
-  () => shutdown('SIGTERM')
-);
-
-process.on(
-  'uncaughtException',
-  error => {
-    errorLog(
-      'Uncaught exception:',
-      error
-    );
-  }
-);
-
-process.on(
-  'unhandledRejection',
-  reason => {
-    errorLog(
-      'Unhandled rejection:',
-      reason
-    );
-  }
+  shutdown
 );
