@@ -1120,13 +1120,73 @@ async function sendDropAlert({
   stats.drops++;
 
   console.log(
-    `[DROP ALERT SENT] ` +
-    `id=${id} ` +
-    `type=${alertType} ` +
-    `targets=${sent}`
-  );
+  `[DROP ALERT SENT] ` +
+  `id=${id} ` +
+  `type=${alertType} ` +
+  `targets=${sent}`
+);
 
-  return true;
+// ============================================================
+// WATCHER CONNECTION
+// ============================================================
+
+if (
+  messageType === 'active' ||
+  (
+    messageType === 'discovered' &&
+    (
+      remainingSeconds == null ||
+      remainingSeconds <= 15
+    )
+  )
+) {
+  const watchSlug =
+    getCampaignWatchSlug(
+      campaign,
+      matched
+    );
+
+  if (watchSlug) {
+    try {
+      const watcherResult =
+        await startWatcher(
+          env,
+          {
+            slug: watchSlug,
+            campaignId: id,
+            campaignName:
+              campaignName(campaign),
+            watchSeconds:
+              getRequiredWatchSeconds(
+                campaign
+              ),
+            startAt:
+              campaignStart(campaign)
+                ? new Date(
+                    campaignStart(campaign)
+                  ).toISOString()
+                : null
+          }
+        );
+
+      console.log(
+        `[WATCHER] campaign=${id} ` +
+        `slug=${watchSlug} ` +
+        `result=${JSON.stringify(
+          watcherResult
+        )}`
+      );
+
+    } catch (error) {
+      console.error(
+        `[WATCHER] ${watchSlug} failed:`,
+        error?.message || error
+      );
+    }
+  }
+}
+
+return true;
 }
 
 
@@ -1900,7 +1960,48 @@ async function updateChannel(
     stats.offline++;
   }
 }
+function getCampaignWatchSlug(campaign, matched = []) {
+  const tracked = matched.find(
+    channel => channel?.slug
+  );
 
+  if (tracked?.slug) {
+    return String(tracked.slug).trim();
+  }
+
+  const candidates = extractCampaignChannels(campaign);
+
+  const candidate = candidates.find(
+    item => item?.slug || item?.username
+  );
+
+  return (
+    candidate?.slug ||
+    candidate?.username ||
+    null
+  );
+}
+
+function getRequiredWatchSeconds(campaign) {
+  const seconds = Number(
+    campaign?.watch_seconds ??
+    campaign?.required_watch_seconds
+  );
+
+  if (Number.isFinite(seconds) && seconds > 0) {
+    return Math.ceil(seconds);
+  }
+
+  const minutes = Number(
+    campaign?.watch_time_minutes
+  );
+
+  if (Number.isFinite(minutes) && minutes > 0) {
+    return Math.ceil(minutes * 60);
+  }
+
+  return null;
+}
 
 // ============================================================
 // STREAM DROP CONFIRMATION
