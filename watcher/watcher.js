@@ -49,6 +49,7 @@ const pages = new Map();
 let context = null;
 let startupPromise = null;
 let shuttingDown = false;
+let browserError = null;
 
 function log(...args) {
   console.log(
@@ -313,6 +314,7 @@ app.get(
       ok: true,
       browserReady:
         Boolean(context),
+      browserError,
       activeStreams:
         activePages().length,
       maxStreams:
@@ -472,12 +474,16 @@ const server =
         log(
           'Watcher ready. Log into Kick in the opened Chromium profile.'
         );
-      } catch (error) {
-        errorLog(
-          'Browser startup failed:',
-          error?.message ||
-            error
-        );
+} catch (error) {
+  browserError =
+    error?.stack ||
+    error?.message ||
+    String(error);
+
+  errorLog(
+    'Browser startup failed:',
+    browserError
+  );
       }
     }
   );
