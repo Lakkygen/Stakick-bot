@@ -1,10 +1,17 @@
 // src/services/ai.js
 // ============================================================
-// STAKICKBOT — OPENROUTER CHAT COMPLETIONS
+// STAKICKBOT — OPENROUTER AI + CONVERSATION MEMORY SUPPORT
 // ============================================================
 
 const DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1';
 const DEFAULT_MODEL = 'google/gemini-2.5-flash-preview:free';
+
+const DEFAULT_SYSTEM_PROMPT =
+  'You are StakickBot, a helpful assistant. ' +
+  'Use the conversation history provided to maintain continuity. ' +
+  'Remember relevant information from earlier messages in the same conversation. ' +
+  'Do not claim to remember information that is not present in the supplied context. ' +
+  'Keep answers concise, useful, and preferably under 400 words.';
 
 function normalizeBaseUrl(url) {
   return String(url || DEFAULT_BASE_URL)
@@ -14,17 +21,20 @@ function normalizeBaseUrl(url) {
 }
 
 function extractText(data) {
-  const content = data?.choices?.[0]?.message?.content;
+  const content =
+    data?.choices?.[0]?.message?.content;
 
   if (typeof content === 'string') {
     return content.trim();
   }
 
-  // Some providers can return structured content.
   if (Array.isArray(content)) {
     return content
-      .map(part => {
-        if (typeof part === 'string') return part;
+      .map((part) => {
+        if (typeof part === 'string') {
+          return part;
+        }
+
         return part?.text || '';
       })
       .join('')
@@ -34,20 +44,41 @@ function extractText(data) {
   return '';
 }
 
-export async function queryAI(env, prompt, opts = {}) {
+function cleanHistory(history) {
+  if (!Array.isArray(history)) {
+    return [];
+  }
+
+  return history
+    .filter(
+      (message) =>
+        message &&
+        (message.role === 'user' ||
+          message.role === 'assistant' ||
+          message.role === 'system') &&
+        typeof message.content === 'string' &&
+        message.content.trim()
+    )
+    .map((message) => ({
+      role: message.role,
+      content: message.content.trim(),
+    }));
+}
+
+export async function queryAI(
+  env,
+  prompt,
+  opts = {}
+) {
   const apiKey =
     env.OPENROUTER_API_KEY ||
     env.OPENAI_API_KEY ||
     env.OPENAI_KEY;
 
-  // Preferred:
-  // OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
-  //
-  // Your old OPENAI_BASE_URL is still supported for compatibility.
   const baseUrl = normalizeBaseUrl(
     env.OPENROUTER_BASE_URL ||
-    env.OPENAI_BASE_URL ||
-    DEFAULT_BASE_URL
+      env.OPENAI_BASE_URL ||
+      DEFAULT_BASE_URL
   );
 
   const model =
@@ -55,7 +86,9 @@ export async function queryAI(env, prompt, opts = {}) {
     env.OPENAI_MODEL ||
     DEFAULT_MODEL;
 
-  const maxTokens = Number.isFinite(Number(opts.maxTokens))
+  const maxTokens = Number.isFinite(
+    Number(opts.maxTokens)
+  )
     ? Number(opts.maxTokens)
     : 600;
 
@@ -66,7 +99,11 @@ export async function queryAI(env, prompt, opts = {}) {
 
   const systemPrompt =
     opts.systemPrompt ||
-    'You are StakickBot, a helpful assistant. Keep answers concise, useful, and preferably under 400 words.';
+    DEFAULT_SYSTEM_PROMPT;
+
+  const history = cleanHistory(
+    opts.history
+  );
 
   const host =
     opts.host ||
@@ -74,61 +111,99 @@ export async function queryAI(env, prompt, opts = {}) {
     'stakick-bot.workers.dev';
 
   if (!apiKey) {
-    throw new Error('No OpenRouter API key configured.');
+    throw new Error(
+      'No OpenRouter API key configured.'
+    );
   }
 
   if (!model) {
-    throw new Error('No AI model configured.');
+    throw new Error(
+      'No AI model configured.'
+    );
   }
 
-  if (!prompt || !String(prompt).trim()) {
-    throw new Error('No prompt provided.');
+  if (
+    !prompt ||
+    !String(prompt).trim()
+  ) {
+    throw new Error(
+      'No prompt provided.'
+    );
   }
 
-  const endpoint = `${baseUrl}/chat/completions`;
+  const messages = [
+    {
+      role: 'system',
+      content: systemPrompt,
+    },
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 25_000);
+    ...history,
+
+    {
+      role: 'user',
+      content: String(prompt).trim(),
+    },
+  ];
+
+  const endpoint =
+    `${baseUrl}/chat/completions`;
+
+  const controller =
+    new AbortController();
+
+  const timeout =
+    setTimeout(
+      () => controller.abort(),
+      25_000
+    );
 
   try {
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`,
+    const response =
+      await fetch(
+        endpoint,
+        {
+          method: 'POST',
 
-        // OpenRouter recommends these optional attribution headers.
-        'HTTP-Referer': `https://${host}`,
-        'X-Title': 'StakickBot',
-      },
+          headers: {
+            'Content-Type':
+              'application/json',
 
-      body: JSON.stringify({
-        model,
+            'Authorization':
+              `Bearer ${apiKey}`,
 
-        messages: [
-          {
-            role: 'system',
-            content: systemPrompt,
+            'HTTP-Referer':
+              `https://${host}`,
+
+            'X-Title':
+              'StakickBot',
           },
-          {
-            role: 'user',
-            content: String(prompt),
-          },
-        ],
 
-        max_tokens: maxTokens,
-        temperature,
-      }),
+          body: JSON.stringify({
+            model,
 
-      signal: controller.signal,
-    });
+            messages,
 
-    const raw = await response.text();
+            max_tokens:
+              maxTokens,
+
+            temperature,
+          }),
+
+          signal:
+            controller.signal,
+        }
+      );
+
+    const raw =
+      await response.text();
 
     let data = null;
 
     try {
-      data = raw ? JSON.parse(raw) : null;
+      data =
+        raw
+          ? JSON.parse(raw)
+          : null;
     } catch {
       data = null;
     }
@@ -141,20 +216,30 @@ export async function queryAI(env, prompt, opts = {}) {
         'Unknown provider error';
 
       throw new Error(
-        `OpenRouter error (${response.status}): ${String(providerMessage).slice(0, 500)}`
+        `OpenRouter error (${response.status}): ${String(
+          providerMessage
+        ).slice(0, 500)}`
       );
     }
 
-    const text = extractText(data);
+    const text =
+      extractText(data);
 
     if (!text) {
-      throw new Error('OpenRouter returned an empty AI response.');
+      throw new Error(
+        'OpenRouter returned an empty AI response.'
+      );
     }
 
     return text;
   } catch (error) {
-    if (error?.name === 'AbortError') {
-      throw new Error('AI request timed out after 25 seconds.');
+    if (
+      error?.name ===
+      'AbortError'
+    ) {
+      throw new Error(
+        'AI request timed out after 25 seconds.'
+      );
     }
 
     throw error;
