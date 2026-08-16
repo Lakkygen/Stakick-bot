@@ -153,7 +153,7 @@ async function ensureBrowser() {
         await chromium.launchPersistentContext(
           PROFILE_PATH,
           {
-            headless: false,
+            headless: true,
             viewport: {
               width: 1280,
               height: 720
@@ -461,9 +461,7 @@ app.use(
 );
 
 const server =
-  app.listen(
-    PORT,
-    async () => {
+app.listen(PORT, "0.0.0.0", async () => {
       log(
         `Stakick watcher listening on port ${PORT}`
       );
