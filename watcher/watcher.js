@@ -33,23 +33,6 @@ const NAVIGATION_TIMEOUT_MS = Math.min(
   120000
 );
 
-/*
- * Abasthan's Playwright environment downloaded both:
- *
- * chromium-1234/.../chrome
- * chromium_headless_shell-1234/.../chrome-headless-shell
- *
- * The health log showed the headless-shell executable failing with ENOENT.
- * We therefore explicitly use the normal Chrome executable.
- *
- * You can override this later with:
- * CHROME_EXECUTABLE_PATH=/some/other/chrome
- */
-const CHROME_EXECUTABLE_PATH = String(
-  process.env.CHROME_EXECUTABLE_PATH ||
-    '/home/abasthan/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome'
-).trim();
-
 const pages = new Map();
 
 let context = null;
@@ -102,9 +85,7 @@ function validSlug(value) {
     .replace(/^@/, '')
     .trim();
 
-  if (
-    !/^[a-zA-Z0-9_.-]{1,100}$/.test(slug)
-  ) {
+  if (!/^[a-zA-Z0-9_.-]{1,100}$/.test(slug)) {
     return null;
   }
 
@@ -116,17 +97,12 @@ function authorized(req) {
     return false;
   }
 
-  return (
-    req.get('x-watcher-secret') ===
-    WATCHER_SECRET
-  );
+  return req.get('x-watcher-secret') === WATCHER_SECRET;
 }
 
 async function ensureBrowser() {
   if (shuttingDown) {
-    throw new Error(
-      'Watcher is shutting down'
-    );
+    throw new Error('Watcher is shutting down');
   }
 
   if (context) {
@@ -140,53 +116,25 @@ async function ensureBrowser() {
   startupPromise = (async () => {
     browserError = null;
 
-    fs.mkdirSync(
-      PROFILE_PATH,
-      {
-        recursive: true
-      }
-    );
+    fs.mkdirSync(PROFILE_PATH, {
+      recursive: true
+    });
 
-    log(
-      `Chromium profile: ${PROFILE_PATH}`
-    );
+    log(`Profile directory: ${PROFILE_PATH}`);
 
-    log(
-      `Chrome executable: ${CHROME_EXECUTABLE_PATH}`
-    );
-
-    if (
-      !fs.existsSync(
-        CHROME_EXECUTABLE_PATH
-      )
-    ) {
-      throw new Error(
-        `Chrome executable not found: ${CHROME_EXECUTABLE_PATH}`
-      );
-    }
-
-    try {
-      fs.accessSync(
-        CHROME_EXECUTABLE_PATH,
-        fs.constants.X_OK
-      );
-    } catch {
-      throw new Error(
-        `Chrome executable is not executable: ${CHROME_EXECUTABLE_PATH}`
-      );
-    }
-
-    log(
-      'Launching Chromium...'
-    );
+    /*
+     * IMPORTANT:
+     * No executablePath is specified here.
+     *
+     * Playwright will resolve the Chromium installation
+     * from PLAYWRIGHT_BROWSERS_PATH=0.
+     */
+    log('Launching Playwright Chromium...');
 
     const browser =
       await chromium.launchPersistentContext(
         PROFILE_PATH,
         {
-          executablePath:
-            CHROME_EXECUTABLE_PATH,
-
           headless: true,
 
           viewport: {
@@ -205,30 +153,20 @@ async function ensureBrowser() {
         }
       );
 
-    browser.setDefaultTimeout(
-      15000
-    );
+    browser.setDefaultTimeout(15000);
 
     browser.setDefaultNavigationTimeout(
       NAVIGATION_TIMEOUT_MS
     );
 
-    browser.on(
-      'close',
-      () => {
-        log(
-          'Chromium context closed.'
-        );
-
-        context = null;
-      }
-    );
+    browser.on('close', () => {
+      log('Chromium context closed.');
+      context = null;
+    });
 
     context = browser;
 
-    log(
-      'Chromium ready.'
-    );
+    log('Chromium ready.');
 
     return browser;
   })();
@@ -253,9 +191,7 @@ async function ensureBrowser() {
 }
 
 function activePages() {
-  return [
-    ...pages.values()
-  ].filter(
+  return [...pages.values()].filter(
     entry =>
       entry.page &&
       !entry.page.isClosed()
@@ -271,8 +207,7 @@ function findExisting(slug) {
 }
 
 async function openStream(slug) {
-  const existing =
-    findExisting(slug);
+  const existing = findExisting(slug);
 
   if (existing) {
     return {
@@ -283,62 +218,42 @@ async function openStream(slug) {
     };
   }
 
-  if (
-    activePages().length >=
-    MAX_PAGES
-  ) {
+  if (activePages().length >= MAX_PAGES) {
     throw new Error(
       `Maximum active pages reached (${MAX_PAGES})`
     );
   }
 
-  const browser =
-    await ensureBrowser();
+  const browser = await ensureBrowser();
 
-  const page =
-    await browser.newPage();
+  const page = await browser.newPage();
 
   const pageId =
     `${Date.now()}-${Math.random()
       .toString(36)
       .slice(2, 8)}`;
 
-  pages.set(
-    pageId,
-    {
-      id: pageId,
-      slug,
-      page,
-      openedAt: Date.now()
-    }
-  );
+  pages.set(pageId, {
+    id: pageId,
+    slug,
+    page,
+    openedAt: Date.now()
+  });
 
-  page.on(
-    'close',
-    () => {
-      pages.delete(pageId);
-    }
-  );
+  page.on('close', () => {
+    pages.delete(pageId);
+  });
 
   try {
     const url =
-      `https://kick.com/${encodeURIComponent(
-        slug
-      )}`;
+      `https://kick.com/${encodeURIComponent(slug)}`;
 
-    log(
-      `[WATCH] Opening ${url}`
-    );
+    log(`[WATCH] Opening ${url}`);
 
-    await page.goto(
-      url,
-      {
-        waitUntil:
-          'domcontentloaded',
-        timeout:
-          NAVIGATION_TIMEOUT_MS
-      }
-    );
+    await page.goto(url, {
+      waitUntil: 'domcontentloaded',
+      timeout: NAVIGATION_TIMEOUT_MS
+    });
 
     return {
       ok: true,
@@ -348,9 +263,7 @@ async function openStream(slug) {
       url
     };
   } catch (error) {
-    pages.delete(
-      pageId
-    );
+    pages.delete(pageId);
 
     try {
       await page.close();
@@ -361,247 +274,175 @@ async function openStream(slug) {
 }
 
 /*
- * Health endpoint.
+ * Basic service health.
  *
- * This stays available even if Chromium fails.
- * That lets us see the exact browser error.
+ * This endpoint deliberately does NOT require the watcher secret
+ * so Abasthan can check the service.
  */
-app.get(
-  '/health',
-  (req, res) => {
-    res.json({
-      ok: true,
+app.get('/health', (req, res) => {
+  res.json({
+    ok: true,
+    browserReady: Boolean(context),
+    browserError,
+    activeStreams: activePages().length,
+    maxStreams: MAX_PAGES,
+    uptime: Math.floor(process.uptime()),
+    port: PORT,
+    playwrightBrowsersPath:
+      process.env.PLAYWRIGHT_BROWSERS_PATH || 'default'
+  });
+});
 
-      browserReady:
-        Boolean(context),
+app.get('/', (req, res) => {
+  res.json({
+    ok: true,
+    service: 'stakick-watcher',
+    browserReady: Boolean(context),
+    activeStreams: activePages().length
+  });
+});
 
-      browserError,
-
-      activeStreams:
-        activePages().length,
-
-      maxStreams:
-        MAX_PAGES,
-
-      uptime:
-        Math.floor(
-          process.uptime()
-        ),
-
-      port:
-        PORT
+app.get('/streams', (req, res) => {
+  if (!authorized(req)) {
+    return res.status(401).json({
+      ok: false,
+      error: 'Unauthorized'
     });
   }
-);
 
-/*
- * Root endpoint.
- */
-app.get(
-  '/',
-  (req, res) => {
-    res.json({
-      ok: true,
-      service:
-        'stakick-watcher',
-      browserReady:
-        Boolean(context),
-      activeStreams:
-        activePages().length
+  return res.json({
+    ok: true,
+    streams: activePages().map(entry => ({
+      pageId: entry.id,
+      slug: entry.slug,
+      openedAt: entry.openedAt,
+      url: `https://kick.com/${entry.slug}`
+    }))
+  });
+});
+
+app.post('/watch', async (req, res) => {
+  if (!authorized(req)) {
+    return res.status(401).json({
+      ok: false,
+      error: 'Unauthorized'
     });
   }
-);
 
-app.get(
-  '/streams',
-  (req, res) => {
-    if (!authorized(req)) {
-      return res.status(401).json({
-        ok: false,
-        error:
-          'Unauthorized'
-      });
-    }
+  const slug = validSlug(req.body?.slug);
+
+  if (!slug) {
+    return res.status(400).json({
+      ok: false,
+      error: 'Invalid Kick channel slug'
+    });
+  }
+
+  try {
+    const result = await openStream(slug);
+
+    log(`[WATCH] ${slug} opened`);
 
     return res.json({
       ok: true,
+      ...result
+    });
+  } catch (error) {
+    errorLog(
+      `[WATCH] ${slug} failed:`,
+      error?.stack ||
+        error?.message ||
+        error
+    );
 
-      streams:
-        activePages().map(
-          entry => ({
-            pageId:
-              entry.id,
-
-            slug:
-              entry.slug,
-
-            openedAt:
-              entry.openedAt,
-
-            url:
-              `https://kick.com/${entry.slug}`
-          })
-        )
+    return res.status(500).json({
+      ok: false,
+      error:
+        error?.message ||
+        'Failed to open stream'
     });
   }
-);
+});
 
-app.post(
-  '/watch',
-  async (req, res) => {
-    if (!authorized(req)) {
-      return res.status(401).json({
-        ok: false,
-        error:
-          'Unauthorized'
-      });
-    }
+app.post('/close', async (req, res) => {
+  if (!authorized(req)) {
+    return res.status(401).json({
+      ok: false,
+      error: 'Unauthorized'
+    });
+  }
 
-    const slug =
-      validSlug(
-        req.body?.slug
-      );
+  const pageId =
+    String(req.body?.pageId || '').trim();
 
-    if (!slug) {
-      return res.status(400).json({
-        ok: false,
-        error:
-          'Invalid Kick channel slug'
-      });
-    }
+  const entry = pages.get(pageId);
+
+  if (!entry) {
+    return res.status(404).json({
+      ok: false,
+      error: 'Page not found'
+    });
+  }
+
+  pages.delete(pageId);
+
+  try {
+    await entry.page.close();
+  } catch {}
+
+  return res.json({
+    ok: true,
+    closed: true,
+    pageId
+  });
+});
+
+app.use((req, res) => {
+  res.status(404).json({
+    ok: false,
+    error: 'Route not found'
+  });
+});
+
+const server = app.listen(
+  PORT,
+  '0.0.0.0',
+  async () => {
+    log(
+      `Stakick watcher listening on ${PORT}`
+    );
 
     try {
-      const result =
-        await openStream(
-          slug
-        );
+      await ensureBrowser();
 
       log(
-        `[WATCH] ${slug} opened`
+        'Watcher ready.'
       );
-
-      return res.json({
-        ok: true,
-        ...result
-      });
     } catch (error) {
+      /*
+       * Do NOT terminate the HTTP server.
+       *
+       * This allows /health to remain available and
+       * expose the exact Chromium startup error.
+       */
       errorLog(
-        `[WATCH] ${slug} failed:`,
+        'Browser startup failed:',
         error?.stack ||
           error?.message ||
           error
       );
-
-      return res.status(500).json({
-        ok: false,
-        error:
-          error?.message ||
-          'Failed to open stream'
-      });
     }
   }
 );
-
-app.post(
-  '/close',
-  async (req, res) => {
-    if (!authorized(req)) {
-      return res.status(401).json({
-        ok: false,
-        error:
-          'Unauthorized'
-      });
-    }
-
-    const pageId =
-      String(
-        req.body?.pageId || ''
-      ).trim();
-
-    const entry =
-      pages.get(
-        pageId
-      );
-
-    if (!entry) {
-      return res.status(404).json({
-        ok: false,
-        error:
-          'Page not found'
-      });
-    }
-
-    pages.delete(
-      pageId
-    );
-
-    try {
-      await entry.page.close();
-    } catch {}
-
-    return res.json({
-      ok: true,
-      closed: true,
-      pageId
-    });
-  }
-);
-
-app.use(
-  (req, res) => {
-    res.status(404).json({
-      ok: false,
-      error:
-        'Route not found'
-    });
-  }
-);
-
-const server =
-  app.listen(
-    PORT,
-    '0.0.0.0',
-    async () => {
-      log(
-        `Stakick watcher listening on port ${PORT}`
-      );
-
-      try {
-        await ensureBrowser();
-
-        log(
-          'Watcher ready. Chromium is running.'
-        );
-      } catch (error) {
-        /*
-         * Keep Express alive.
-         * /health will expose browserError.
-         */
-        errorLog(
-          'Browser startup failed during server startup:',
-          error?.stack ||
-            error?.message ||
-            error
-        );
-      }
-    }
-  );
 
 async function shutdown() {
-  if (shuttingDown) {
-    return;
-  }
+  if (shuttingDown) return;
 
   shuttingDown = true;
 
-  log(
-    'Shutting down watcher...'
-  );
+  log('Shutting down watcher...');
 
-  for (
-    const entry
-      of activePages()
-  ) {
+  for (const entry of activePages()) {
     try {
       await entry.page.close();
     } catch {}
@@ -617,19 +458,10 @@ async function shutdown() {
     context = null;
   }
 
-  server.close(
-    () => {
-      process.exit(0);
-    }
-  );
+  server.close(() => {
+    process.exit(0);
+  });
 }
 
-process.on(
-  'SIGINT',
-  shutdown
-);
-
-process.on(
-  'SIGTERM',
-  shutdown
-);
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
