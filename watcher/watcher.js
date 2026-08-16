@@ -154,6 +154,7 @@ async function ensureBrowser() {
           PROFILE_PATH,
           {
             headless: true,
+            channel: "chromium"
             viewport: {
               width: 1280,
               height: 720
