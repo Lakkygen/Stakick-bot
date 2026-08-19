@@ -4,13 +4,17 @@ import { DurableObject } from 'cloudflare:workers';
 import { tg } from './telegram';
 import { parseInput } from './parser';
 import { commandRegistry } from './config';
-import { requireAdmin, requireGroup } from './middleware/auth';
+import {
+  requireAdmin,
+  requireGroup
+} from './middleware/auth';
 import { rateLimit } from './middleware/rateLimit';
 import { logCommand } from './middleware/logger';
 import { handleNewMembers } from './commands/group/welcome';
 import { checkReminders } from './commands/external/remind';
 import { runMonitor } from './kick/monitor';
 import { handleKickEventSub } from './kick/eventsub';
+
 import { queryAI } from './services/ai';
 import { ensureSchema } from './db';
 
@@ -28,11 +32,17 @@ const MONITOR_ALARM_NAME = 'main';
 // ============================================================
 
 function getOwnerId(env) {
-  return String(env.OWNER_ID || '6816397800');
+  return String(
+    env.OWNER_ID || '6816397800'
+  );
 }
 
-function isAuthorizedSecret(env, provided) {
-  const configured = env.SETUP_SECRET;
+function isAuthorizedSecret(
+  env,
+  provided
+) {
+  const configured =
+    env.SETUP_SECRET;
 
   if (!configured) {
     return true;
@@ -41,24 +51,70 @@ function isAuthorizedSecret(env, provided) {
   return provided === configured;
 }
 
-async function whitelistCheck(c, update) {
-  const OWNER_ID = getOwnerId(c.env);
+/*
+ * Extract Telegram identity safely.
+ */
+function getTelegramContext(update) {
+  const message =
+    update?.message;
 
-  const chatId =
-    update.message?.chat?.id ||
-    update.callback_query?.message?.chat?.id;
+  const callback =
+    update?.callback_query;
 
-  const userId =
-    update.message?.from?.id ||
-    update.callback_query?.from?.id;
+  const chat =
+    message?.chat ||
+    callback?.message?.chat ||
+    null;
 
-  const chatType =
-    update.message?.chat?.type ||
-    update.callback_query?.message?.chat?.type;
+  const user =
+    message?.from ||
+    callback?.from ||
+    null;
+
+  return {
+    chatId:
+      chat?.id ?? null,
+
+    userId:
+      user?.id ?? null,
+
+    chatType:
+      chat?.type || null,
+
+    username:
+      user?.username || null,
+
+    firstName:
+      user?.first_name || null,
+
+    lastName:
+      user?.last_name || null
+  };
+}
+
+async function whitelistCheck(
+  c,
+  update
+) {
+  const OWNER_ID =
+    getOwnerId(c.env);
+
+  const {
+    chatId,
+    userId,
+    chatType
+  } =
+    getTelegramContext(
+      update
+    );
 
   const text =
-    update.message?.text || '';
+    update.message?.text ||
+    '';
 
+  /*
+   * Owner's private chat is always allowed.
+   */
   if (
     chatType === 'private' &&
     String(userId) === OWNER_ID
@@ -66,6 +122,10 @@ async function whitelistCheck(c, update) {
     return true;
   }
 
+  /*
+   * Owner can use /approve even before
+   * a group has been whitelisted.
+   */
   if (
     String(userId) === OWNER_ID &&
     text
@@ -81,10 +141,18 @@ async function whitelistCheck(c, update) {
       'bot_whitelist'
     );
 
-  const whitelist =
-    whitelistRaw
-      ? JSON.parse(whitelistRaw)
-      : [];
+  let whitelist = [];
+
+  try {
+    whitelist =
+      whitelistRaw
+        ? JSON.parse(
+            whitelistRaw
+          )
+        : [];
+  } catch {
+    whitelist = [];
+  }
 
   if (
     whitelist.includes(
@@ -94,7 +162,11 @@ async function whitelistCheck(c, update) {
     return true;
   }
 
-  if (update.message) {
+  if (
+    update.message &&
+    chatId !== null &&
+    chatId !== undefined
+  ) {
     await tg.sendMessage(
       c.env.BOT_TOKEN,
       chatId,
@@ -105,28 +177,81 @@ async function whitelistCheck(c, update) {
   return false;
 }
 
+// ============================================================
+// AI
+// ============================================================
+
 async function handleOpenRouterAI(
   c,
-  prompt
+  prompt,
+  {
+    chatId = null,
+    userId = null
+  } = {}
 ) {
   try {
     const host =
-      c.req.header('host') ||
+      c.req.header(
+        'host'
+      ) ||
       'stakick-bot.workers.dev';
+
+    if (
+      chatId === null ||
+      chatId === undefined
+    ) {
+      throw new Error(
+        'Unable to determine Telegram chat ID.'
+      );
+    }
+
+    if (
+      userId === null ||
+      userId === undefined
+    ) {
+      throw new Error(
+        'Unable to determine Telegram user ID.'
+      );
+    }
 
     const reply =
       await queryAI(
         c.env,
         prompt,
-        { host }
+        {
+          host,
+
+          /*
+           * These two values are what make persistent
+           * conversation memory actually work.
+           */
+          chatId,
+          userId,
+
+          useMemory:
+            true,
+
+          saveMemory:
+            true
+        }
       );
 
     return (
       reply ||
       '❌ Empty AI response.'
     );
-  } catch (err) {
-    return `❌ AI error: ${err.message}`;
+  } catch (error) {
+    console.error(
+      'AI request failed:',
+      error
+    );
+
+    return (
+      `❌ AI error: ${
+        error?.message ||
+        'Unknown AI error'
+      }`
+    );
   }
 }
 
@@ -134,7 +259,9 @@ async function handleOpenRouterAI(
 // DURABLE OBJECT ACCESS
 // ============================================================
 
-function getMonitorStub(env) {
+function getMonitorStub(
+  env
+) {
   if (!env.MONITOR_ALARM) {
     throw new Error(
       'MONITOR_ALARM Durable Object binding is missing.'
@@ -146,7 +273,9 @@ function getMonitorStub(env) {
       MONITOR_ALARM_NAME
     );
 
-  return env.MONITOR_ALARM.get(id);
+  return env.MONITOR_ALARM.get(
+    id
+  );
 }
 
 async function callMonitorDO(
@@ -162,13 +291,17 @@ async function callMonitorDO(
       `https://monitor.internal${path}`,
       {
         method:
-          options.method || 'GET',
+          options.method ||
+          'GET',
+
         headers: {
           'content-type':
             'application/json'
         },
+
         body:
-          options.body || undefined
+          options.body ||
+          undefined
       }
     );
 
@@ -179,7 +312,8 @@ async function callMonitorDO(
       await response.json();
   } catch {
     payload = {
-      ok: response.ok
+      ok:
+        response.ok
     };
   }
 
@@ -197,32 +331,44 @@ const middlewareMap = {
   requireAdmin,
   requireGroup,
   rateLimit,
-  logCommand,
+  logCommand
 };
 
 // ============================================================
 // BASIC ROUTES
 // ============================================================
 
-app.get('/', (c) => {
-  return c.json({
-    status:
-      'Stakick is alive',
-    owner:
-      c.env.OWNER_KICK_SLUG ||
-      'unknown',
-    service:
-      'stakick-bot',
-    version:
-      '3.0.0',
-    monitor:
-      'durable-object-alarm',
-    monitor_interval_ms:
-      MONITOR_INTERVAL_MS,
-    timestamp:
-      new Date().toISOString(),
-  });
-});
+app.get(
+  '/',
+  (c) => {
+    return c.json({
+      status:
+        'Stakick is alive',
+
+      owner:
+        c.env.OWNER_KICK_SLUG ||
+        'unknown',
+
+      service:
+        'stakick-bot',
+
+      version:
+        '3.1.0',
+
+      monitor:
+        'durable-object-alarm',
+
+      monitor_interval_ms:
+        MONITOR_INTERVAL_MS,
+
+      ai_memory:
+        'd1-persistent',
+
+      timestamp:
+        new Date().toISOString()
+    });
+  }
+);
 
 // ============================================================
 // HEALTH
@@ -249,10 +395,11 @@ app.get(
         .run();
 
       dbOk = true;
-    } catch (e) {
+    } catch (error) {
       console.error(
         'Health DB check failed:',
-        e.message
+        error?.message ||
+          error
       );
     }
 
@@ -261,7 +408,8 @@ app.get(
         'health_check',
         Date.now().toString(),
         {
-          expirationTtl: 60
+          expirationTtl:
+            60
         }
       );
 
@@ -270,10 +418,11 @@ app.get(
       );
 
       kvOk = true;
-    } catch (e) {
+    } catch (error) {
       console.error(
         'Health KV check failed:',
-        e.message
+        error?.message ||
+          error
       );
     }
 
@@ -291,18 +440,22 @@ app.get(
 
       monitor =
         result.payload;
-    } catch (e) {
+    } catch (error) {
       monitor = {
         ok: false,
-        error: e.message
+        error:
+          error?.message ||
+          String(error)
       };
     }
 
     const latencyMs =
-      Date.now() - start;
+      Date.now() -
+      start;
 
     if (
-      c.executionCtx?.waitUntil
+      c.executionCtx?.waitUntil &&
+      c.env.DB
     ) {
       c.executionCtx.waitUntil(
         c.env.DB
@@ -319,15 +472,19 @@ app.get(
           )
           .bind(
             'http_health',
+
             dbOk &&
             kvOk &&
             monitor.ok
               ? 'ok'
               : 'degraded',
+
             `db=${dbOk}, kv=${kvOk}, monitor=${Boolean(
               monitor.ok
             )}`,
+
             latencyMs,
+
             Date.now()
           )
           .run()
@@ -339,10 +496,16 @@ app.get(
       ok:
         dbOk &&
         kvOk &&
-        Boolean(monitor.ok),
+        Boolean(
+          monitor.ok
+        ),
 
-      db: dbOk,
-      kv: kvOk,
+      db:
+        dbOk,
+
+      kv:
+        kvOk,
+
       monitor,
 
       latency_ms:
@@ -352,7 +515,12 @@ app.get(
         'stakick-bot',
 
       version:
-        '3.0.0',
+        '3.1.0',
+
+      ai_memory:
+        dbOk
+          ? 'available'
+          : 'unavailable',
 
       timestamp:
         new Date().toISOString()
@@ -362,11 +530,6 @@ app.get(
 
 // ============================================================
 // MANUAL MONITOR EXECUTION
-// ============================================================
-//
-// /run now goes through the Durable Object so manual runs and
-// alarm runs are serialized through the same stateful monitor.
-//
 // ============================================================
 
 app.get(
@@ -403,27 +566,32 @@ app.get(
           c.env,
           '/run',
           {
-            method: 'POST'
+            method:
+              'POST'
           }
         );
 
       return c.json({
         ...result.payload,
+
         duration_ms:
           Date.now() -
           start
       });
-    } catch (err) {
+    } catch (error) {
       console.error(
         '❌ /run error:',
-        err
+        error
       );
 
       return c.json(
         {
           ok: false,
+
           error:
-            err.message,
+            error?.message ||
+            String(error),
+
           duration_ms:
             Date.now() -
             start
@@ -463,7 +631,8 @@ app.get(
           c.env,
           '/start',
           {
-            method: 'POST'
+            method:
+              'POST'
           }
         );
 
@@ -480,7 +649,8 @@ app.get(
         {
           ok: false,
           error:
-            error.message
+            error?.message ||
+            String(error)
         },
         500
       );
@@ -517,7 +687,8 @@ app.get(
           c.env,
           '/stop',
           {
-            method: 'POST'
+            method:
+              'POST'
           }
         );
 
@@ -534,7 +705,8 @@ app.get(
         {
           ok: false,
           error:
-            error.message
+            error?.message ||
+            String(error)
         },
         500
       );
@@ -580,7 +752,8 @@ app.get(
         {
           ok: false,
           error:
-            error.message
+            error?.message ||
+            String(error)
         },
         500
       );
@@ -599,6 +772,9 @@ app.post(
       crypto.randomUUID();
 
     try {
+      /*
+       * Make sure D1 contains the AI memory tables.
+       */
       await ensureSchema(
         c.env
       );
@@ -610,6 +786,28 @@ app.post(
         'update',
         update
       );
+
+      // --------------------------------------------------------
+      // IDENTITY
+      // --------------------------------------------------------
+
+      const telegram =
+        getTelegramContext(
+          update
+        );
+
+      /*
+       * Store identity in Hono context so future handlers
+       * can access it if needed.
+       */
+      c.set(
+        'telegram',
+        telegram
+      );
+
+      // --------------------------------------------------------
+      // WHITELIST
+      // --------------------------------------------------------
 
       const allowed =
         await whitelistCheck(
@@ -623,7 +821,11 @@ app.post(
         );
       }
 
-      const cachedUsername =
+      // --------------------------------------------------------
+      // BOT USERNAME
+      // --------------------------------------------------------
+
+      let cachedUsername =
         await c.env.KV.get(
           'bot_username'
         );
@@ -635,12 +837,19 @@ app.post(
       ) {
         await c.env.KV.put(
           'bot_username',
-          update.message.from.username
+          update.message
+            .from
+            .username
         );
+
+        cachedUsername =
+          update.message
+            .from
+            .username;
       }
 
       // --------------------------------------------------------
-      // BOT ADDED / REMOVED FROM CHAT
+      // BOT ADDED / REMOVED
       // --------------------------------------------------------
 
       if (
@@ -656,7 +865,8 @@ app.post(
             ?.status;
 
         if (
-          newStatus === 'member' ||
+          newStatus ===
+            'member' ||
           newStatus ===
             'administrator'
         ) {
@@ -695,10 +905,6 @@ app.post(
             );
           }
 
-          /*
-           * Make sure the monitor is running once the bot is
-           * actually active.
-           */
           try {
             await callMonitorDO(
               c.env,
@@ -755,7 +961,55 @@ app.post(
           update.callback_query
             .message;
 
-        if (!callbackMessage) {
+        if (
+          !callbackMessage
+        ) {
+          return c.text(
+            'OK'
+          );
+        }
+
+        /*
+         * AI callback gets its own context-aware path.
+         *
+         * This means a future AI menu button can also use
+         * persistent memory.
+         */
+        if (
+          data ===
+          'cmd_ai'
+        ) {
+          const prompt =
+            update.callback_query
+              ?.message
+              ?.text
+              ?.trim();
+
+          /*
+           * We don't send the whole Telegram message as the
+           * actual question. Tell the user to use /ask or
+           * mention the bot if no prompt exists.
+           */
+          const text =
+            prompt
+              ? await handleOpenRouterAI(
+                  c,
+                  prompt,
+                  {
+                    chatId:
+                      telegram.chatId,
+                    userId:
+                      telegram.userId
+                  }
+                )
+              : '🧠 Ask me something with /ask or mention @StakickBot.';
+
+          await tg.sendMessage(
+            c.env.BOT_TOKEN,
+            telegram.chatId,
+            text
+          );
+
           return c.text(
             'OK'
           );
@@ -764,14 +1018,19 @@ app.post(
         const callbackMap = {
           cmd_help:
             'help',
+
           cmd_weather:
             'weather',
+
           cmd_crypto:
             'crypto',
+
           cmd_ai:
             'ask',
+
           cmd_remind:
             'remind',
+
           cmd_kick:
             'kickstatus'
         };
@@ -799,7 +1058,8 @@ app.post(
                 callbackMessage
             },
             {
-              args: ''
+              args:
+                ''
             }
           );
 
@@ -816,7 +1076,9 @@ app.post(
             commandRegistry
               .start;
 
-          if (startCmd) {
+          if (
+            startCmd
+          ) {
             await startCmd[0](
               c,
               {
@@ -824,7 +1086,8 @@ app.post(
                   callbackMessage
               },
               {
-                args: ''
+                args:
+                  ''
               }
             );
           }
@@ -883,9 +1146,9 @@ app.post(
             .split('@')[0]
             .toLowerCase();
 
-        // ------------------
+        // ------------------------------------------------------
         // /approve
-        // ------------------
+        // ------------------------------------------------------
 
         if (
           cmdName ===
@@ -899,7 +1162,8 @@ app.post(
 
           const chatId =
             update.message
-              .chat.id;
+              ?.chat
+              ?.id;
 
           const OWNER_ID =
             getOwnerId(
@@ -931,12 +1195,18 @@ app.post(
               'bot_whitelist'
             );
 
-          const whitelist =
-            whitelistRaw
-              ? JSON.parse(
-                  whitelistRaw
-                )
-              : [];
+          let whitelist = [];
+
+          try {
+            whitelist =
+              whitelistRaw
+                ? JSON.parse(
+                    whitelistRaw
+                  )
+                : [];
+          } catch {
+            whitelist = [];
+          }
 
           if (
             !whitelist.includes(
@@ -966,6 +1236,159 @@ app.post(
           );
         }
 
+        /*
+         * ======================================================
+         * /ask — MEMORY-AWARE AI
+         * ======================================================
+         *
+         * We handle /ask here rather than relying on a separate
+         * command handler that might call queryAI() without
+         * chatId/userId.
+         */
+
+        if (
+          cmdName ===
+          'ask'
+        ) {
+          const chatId =
+            update.message
+              ?.chat
+              ?.id;
+
+          const userId =
+            update.message
+              ?.from
+              ?.id;
+
+          const prompt =
+            String(
+              parsed.args ||
+              ''
+            ).trim();
+
+          if (!prompt) {
+            await tg.sendMessage(
+              c.env.BOT_TOKEN,
+              chatId,
+              '🧠 Usage: /ask your question'
+            );
+
+            return c.text(
+              'OK'
+            );
+          }
+
+          /*
+           * Give /ask the same middleware protections that the
+           * registered command would normally have, if present.
+           *
+           * We only run middleware here; the actual handler is
+           * our memory-aware AI function.
+           */
+          const entry =
+            commandRegistry
+              .ask;
+
+          if (
+            entry
+          ) {
+            const [
+              ,
+              middlewares = [],
+              scope
+            ] = entry;
+
+            const chatType =
+              update.message
+                ?.chat
+                ?.type;
+
+            if (
+              scope ===
+                'group' &&
+              chatType ===
+                'private'
+            ) {
+              await tg.sendMessage(
+                c.env.BOT_TOKEN,
+                chatId,
+                'Use this command in a group!'
+              );
+
+              return c.text(
+                'OK'
+              );
+            }
+
+            for (
+              const mwName
+                of middlewares
+            ) {
+              const middleware =
+                middlewareMap[
+                  mwName
+                ];
+
+              if (
+                !middleware
+              ) {
+                continue;
+              }
+
+              let nextCalled =
+                false;
+
+              const result =
+                await middleware(
+                  c,
+                  () => {
+                    nextCalled =
+                      true;
+                  }
+                );
+
+              if (
+                !nextCalled
+              ) {
+                return (
+                  result ||
+                  c.text(
+                    'OK'
+                  )
+                );
+              }
+            }
+          }
+
+          const reply =
+            await handleOpenRouterAI(
+              c,
+              prompt,
+              {
+                chatId,
+                userId
+              }
+            );
+
+          await tg.sendMessage(
+            c.env.BOT_TOKEN,
+            chatId,
+            reply,
+            {
+              parse_mode:
+                'HTML'
+            }
+          );
+
+          return c.text(
+            'OK'
+          );
+        }
+
+        // ------------------------------------------------------
+        // NORMAL COMMAND REGISTRY
+        // ------------------------------------------------------
+
         const entry =
           commandRegistry[
             cmdName
@@ -980,17 +1403,20 @@ app.post(
 
           const chatType =
             update.message
-              ?.chat?.type;
+              ?.chat
+              ?.type;
 
           if (
-            scope === 'group' &&
+            scope ===
+              'group' &&
             chatType ===
               'private'
           ) {
             await tg.sendMessage(
               c.env.BOT_TOKEN,
               update.message
-                .chat.id,
+                .chat
+                .id,
               'Use this command in a group!'
             );
 
@@ -1001,14 +1427,16 @@ app.post(
 
           for (
             const mwName
-            of middlewares
+              of middlewares
           ) {
             const middleware =
               middlewareMap[
                 mwName
               ];
 
-            if (!middleware) {
+            if (
+              !middleware
+            ) {
               continue;
             }
 
@@ -1029,7 +1457,9 @@ app.post(
             ) {
               return (
                 result ||
-                c.text('OK')
+                c.text(
+                  'OK'
+                )
               );
             }
           }
@@ -1051,22 +1481,40 @@ app.post(
           'natural' &&
         parsed.isMention
       ) {
+        const chatId =
+          update.message
+            ?.chat
+            ?.id;
+
+        const userId =
+          update.message
+            ?.from
+            ?.id;
+
+        const prompt =
+          parsed.args ||
+          parsed.text ||
+          '';
+
         const reply =
           await handleOpenRouterAI(
             c,
-            parsed.args ||
-              parsed.text ||
-              ''
+            prompt,
+            {
+              chatId,
+              userId
+            }
           );
 
         if (
-          update.message
-            ?.chat?.id
+          chatId !==
+            undefined &&
+          chatId !==
+            null
         ) {
           await tg.sendMessage(
             c.env.BOT_TOKEN,
-            update.message
-              .chat.id,
+            chatId,
             reply,
             {
               parse_mode:
@@ -1092,8 +1540,10 @@ app.post(
       return c.json(
         {
           ok: false,
+
           error:
             'Webhook processing failed',
+
           request_id:
             requestId
         },
@@ -1350,7 +1800,8 @@ app.get(
 
             body:
               JSON.stringify({
-                url: webhookUrl,
+                url:
+                  webhookUrl,
 
                 allowed_updates: [
                   'message',
@@ -1415,7 +1866,8 @@ app.get(
         monitorStart = {
           ok: false,
           error:
-            error.message
+            error?.message ||
+            String(error)
         };
       }
 
@@ -1432,7 +1884,10 @@ app.get(
           'stakick-bot',
 
         version:
-          '3.0.0',
+          '3.1.0',
+
+        ai_memory:
+          'd1-persistent',
 
         webhook: {
           url:
@@ -1481,8 +1936,10 @@ app.get(
       return c.json(
         {
           ok: false,
+
           error:
             'Setup failed.',
+
           message:
             error instanceof Error
               ? error.message
@@ -1503,14 +1960,18 @@ app.notFound(
     return c.json(
       {
         ok: false,
+
         error:
           'Route not found',
+
         path:
           new URL(
             c.req.url
           ).pathname,
+
         method:
           c.req.method,
+
         service:
           'stakick-bot'
       },
@@ -1540,19 +2001,12 @@ app.onError(
 // ============================================================
 // DURABLE OBJECT
 // ============================================================
-//
-// One named Durable Object instance controls the monitor.
-//
-// It:
-//   - keeps one alarm
-//   - runs runMonitor()
-//   - schedules itself again
-//   - serializes manual /run and alarm execution
-//
-// ============================================================
 
 export class MonitorAlarm extends DurableObject {
-  constructor(ctx, env) {
+  constructor(
+    ctx,
+    env
+  ) {
     super(
       ctx,
       env
@@ -1583,7 +2037,9 @@ export class MonitorAlarm extends DurableObject {
     return next;
   }
 
-  async alarm(alarmInfo) {
+  async alarm(
+    alarmInfo
+  ) {
     const started =
       Date.now();
 
@@ -1593,13 +2049,19 @@ export class MonitorAlarm extends DurableObject {
     try {
       console.log(
         `[MONITOR ALARM] fired ` +
-        `retry=${alarmInfo?.retryCount || 0}`
+        `retry=${
+          alarmInfo?.retryCount ||
+          0
+        }`
       );
 
       result =
         await runMonitor({
-          env: this.env,
-          executionCtx: null
+          env:
+            this.env,
+
+          executionCtx:
+            null
         });
 
       console.log(
@@ -1607,20 +2069,11 @@ export class MonitorAlarm extends DurableObject {
         `${Date.now() - started}ms`
       );
     } catch (error) {
-      /*
-       * Don't allow one failure to permanently kill the recurring
-       * monitor. Cloudflare retries failed alarms automatically,
-       * but we also explicitly schedule the next run.
-       */
       console.error(
         '[MONITOR ALARM] monitor failed:',
         error
       );
     } finally {
-      /*
-       * A Durable Object has one alarm at a time.
-       * Schedule the next one after this execution finishes.
-       */
       try {
         await this.ctx.storage.setAlarm(
           Date.now() +
@@ -1637,15 +2090,17 @@ export class MonitorAlarm extends DurableObject {
     return result;
   }
 
-  async fetch(request) {
+  async fetch(
+    request
+  ) {
     const url =
       new URL(
         request.url
       );
 
-    // ----------------------------------------------------------
+    // --------------------------------------------------------
     // STATUS
-    // ----------------------------------------------------------
+    // --------------------------------------------------------
 
     if (
       url.pathname ===
@@ -1681,9 +2136,9 @@ export class MonitorAlarm extends DurableObject {
       });
     }
 
-    // ----------------------------------------------------------
+    // --------------------------------------------------------
     // START
-    // ----------------------------------------------------------
+    // --------------------------------------------------------
 
     if (
       url.pathname ===
@@ -1705,9 +2160,13 @@ export class MonitorAlarm extends DurableObject {
 
         return Response.json({
           ok: true,
-          started: true,
+
+          started:
+            true,
+
           first_alarm_at:
             next,
+
           interval_ms:
             MONITOR_INTERVAL_MS
         });
@@ -1715,25 +2174,31 @@ export class MonitorAlarm extends DurableObject {
 
       return Response.json({
         ok: true,
-        started: false,
+
+        started:
+          false,
+
         already_running:
           true,
+
         alarm_at:
           existing,
+
         alarm_in_ms:
           Math.max(
             0,
             existing -
               Date.now()
           ),
+
         interval_ms:
           MONITOR_INTERVAL_MS
       });
     }
 
-    // ----------------------------------------------------------
+    // --------------------------------------------------------
     // STOP
-    // ----------------------------------------------------------
+    // --------------------------------------------------------
 
     if (
       url.pathname ===
@@ -1743,13 +2208,14 @@ export class MonitorAlarm extends DurableObject {
 
       return Response.json({
         ok: true,
-        stopped: true
+        stopped:
+          true
       });
     }
 
-    // ----------------------------------------------------------
+    // --------------------------------------------------------
     // MANUAL RUN
-    // ----------------------------------------------------------
+    // --------------------------------------------------------
 
     if (
       url.pathname ===
@@ -1764,15 +2230,13 @@ export class MonitorAlarm extends DurableObject {
       try {
         stats =
           await runMonitor({
-            env: this.env,
+            env:
+              this.env,
+
             executionCtx:
               null
           });
       } finally {
-        /*
-         * Make sure the recurring monitor continues after
-         * a manual run.
-         */
         await this.ctx.storage.setAlarm(
           Date.now() +
             MONITOR_INTERVAL_MS
@@ -1781,10 +2245,14 @@ export class MonitorAlarm extends DurableObject {
 
       return Response.json({
         ok: true,
-        manual: true,
+
+        manual:
+          true,
+
         duration_ms:
           Date.now() -
           started,
+
         stats
       });
     }
@@ -1792,11 +2260,13 @@ export class MonitorAlarm extends DurableObject {
     return Response.json(
       {
         ok: false,
+
         error:
           'Unknown monitor operation'
       },
       {
-        status: 404
+        status:
+          404
       }
     );
   }
@@ -1825,14 +2295,8 @@ export default {
     ctx
   ) {
     /*
-     * Native Cron is now the WATCHDOG.
-     *
-     * It does NOT directly execute runMonitor().
-     * It merely makes sure the Durable Object alarm is alive.
-     *
-     * This prevents duplicate monitor executions.
+     * Cron acts as a watchdog for the Durable Object alarm.
      */
-
     ctx.waitUntil(
       (async () => {
         try {
@@ -1854,11 +2318,12 @@ export default {
     );
 
     /*
-     * Reminders remain on the normal Cron path.
+     * Existing reminder processing.
      */
     ctx.waitUntil(
       checkReminders({
         env,
+
         executionCtx:
           ctx
       })
