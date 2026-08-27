@@ -16,6 +16,7 @@ import { runMonitor } from './kick/monitor';
 import { handleKickEventSub } from './kick/eventsub';
 
 import { queryAI } from './services/ai';
+import { handleGroupParticipation } from './services/groupIntelligence';
 import { ensureSchema } from './db';
 
 const app = new Hono();
@@ -1463,6 +1464,39 @@ app.post(
               );
             }
           }
+          
+                // --------------------------------------------------------
+      // AUTONOMOUS GROUP PARTICIPATION
+      // --------------------------------------------------------
+
+      if (
+        update.message?.chat?.type ===
+          'group' ||
+        update.message?.chat?.type ===
+          'supergroup'
+      ) {
+        const participation =
+          handleGroupParticipation(
+            c.env,
+            update,
+            {
+              botUsername:
+                cachedUsername ||
+                c.env.BOT_USERNAME ||
+                ''
+            }
+          );
+
+        if (
+          c.executionCtx?.waitUntil
+        ) {
+          c.executionCtx.waitUntil(
+            participation
+          );
+        } else {
+          await participation;
+        }
+      }
 
           return await handler(
             c,
