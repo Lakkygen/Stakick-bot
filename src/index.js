@@ -1118,7 +1118,47 @@ app.post(
           botUsername
         );
 
+      // --------------------------------------------------------
+      // AUTONOMOUS GROUP PARTICIPATION
+      // --------------------------------------------------------
+      //
+      // For messages that the parser does not classify, give the
+      // group-intelligence layer a chance to observe the message.
+      //
+      // Commands and direct @Stakick messages are handled through
+      // their normal paths below.
+      // --------------------------------------------------------
+
       if (!parsed) {
+        if (
+          update.message?.chat?.type ===
+            'group' ||
+          update.message?.chat?.type ===
+            'supergroup'
+        ) {
+          const participation =
+            handleGroupParticipation(
+              c.env,
+              update,
+              {
+                botUsername:
+                  cachedUsername ||
+                  c.env.BOT_USERNAME ||
+                  ''
+              }
+            );
+
+          if (
+            c.executionCtx?.waitUntil
+          ) {
+            c.executionCtx.waitUntil(
+              participation
+            );
+          } else {
+            await participation;
+          }
+        }
+
         return c.text(
           'OK'
         );
@@ -1464,39 +1504,6 @@ app.post(
               );
             }
           }
-          
-                // --------------------------------------------------------
-      // AUTONOMOUS GROUP PARTICIPATION
-      // --------------------------------------------------------
-
-      if (
-        update.message?.chat?.type ===
-          'group' ||
-        update.message?.chat?.type ===
-          'supergroup'
-      ) {
-        const participation =
-          handleGroupParticipation(
-            c.env,
-            update,
-            {
-              botUsername:
-                cachedUsername ||
-                c.env.BOT_USERNAME ||
-                ''
-            }
-          );
-
-        if (
-          c.executionCtx?.waitUntil
-        ) {
-          c.executionCtx.waitUntil(
-            participation
-          );
-        } else {
-          await participation;
-        }
-      }
 
           return await handler(
             c,
@@ -1560,6 +1567,49 @@ app.post(
         return c.text(
           'OK'
         );
+      }
+
+      // --------------------------------------------------------
+      // AUTONOMOUS GROUP PARTICIPATION
+      // --------------------------------------------------------
+      //
+      // This is deliberately AFTER:
+      // - callbacks
+      // - commands
+      // - /ask
+      // - direct @Stakick AI mentions
+      //
+      // Therefore normal bot functionality gets priority.
+      // Only unhandled ordinary group messages reach this layer.
+      // --------------------------------------------------------
+
+      if (
+        update.message?.chat?.type ===
+          'group' ||
+        update.message?.chat?.type ===
+          'supergroup'
+      ) {
+        const participation =
+          handleGroupParticipation(
+            c.env,
+            update,
+            {
+              botUsername:
+                cachedUsername ||
+                c.env.BOT_USERNAME ||
+                ''
+            }
+          );
+
+        if (
+          c.executionCtx?.waitUntil
+        ) {
+          c.executionCtx.waitUntil(
+            participation
+          );
+        } else {
+          await participation;
+        }
       }
 
       return c.text(
