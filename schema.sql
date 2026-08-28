@@ -1,4 +1,12 @@
--- Telegram bot core tables
+-- ============================================================
+-- STAKICKBOT — DATABASE SCHEMA
+-- ============================================================
+
+
+-- ============================================================
+-- TELEGRAM BOT CORE TABLES
+-- ============================================================
+
 CREATE TABLE IF NOT EXISTS mod_logs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   chat_id INTEGER NOT NULL,
@@ -8,6 +16,7 @@ CREATE TABLE IF NOT EXISTS mod_logs (
   reason TEXT,
   created_at INTEGER NOT NULL
 );
+
 
 CREATE TABLE IF NOT EXISTS reminders (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -19,6 +28,7 @@ CREATE TABLE IF NOT EXISTS reminders (
   sent INTEGER DEFAULT 0
 );
 
+
 CREATE TABLE IF NOT EXISTS group_settings (
   chat_id INTEGER PRIMARY KEY,
   anti_spam INTEGER DEFAULT 1,
@@ -26,6 +36,7 @@ CREATE TABLE IF NOT EXISTS group_settings (
   rules TEXT,
   updated_at INTEGER
 );
+
 
 CREATE TABLE IF NOT EXISTS user_stats (
   user_id INTEGER NOT NULL,
@@ -36,7 +47,52 @@ CREATE TABLE IF NOT EXISTS user_stats (
   PRIMARY KEY (user_id, chat_id)
 );
 
--- Kick integration tables
+
+-- ============================================================
+-- GROUP LORE / LONG-TERM GROUP MEMORY
+-- ============================================================
+--
+-- This stores persistent facts about the group itself.
+--
+-- Examples:
+--   "Mike is known as Professor in this group."
+--   "The group regularly jokes about Lure disappearing."
+--   "Everyone usually watches Kick drops together."
+--
+-- The AI decides what is genuinely worth remembering.
+-- Ordinary messages are NOT automatically stored here.
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS group_memories (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+  chat_id INTEGER NOT NULL,
+
+  memory TEXT NOT NULL,
+
+  category TEXT DEFAULT 'group_fact',
+
+  importance REAL DEFAULT 0.60,
+
+  source_user_id INTEGER,
+
+  created_at INTEGER NOT NULL,
+
+  last_used_at INTEGER,
+
+  use_count INTEGER DEFAULT 0
+);
+
+
+CREATE INDEX IF NOT EXISTS
+idx_group_memories_chat
+ON group_memories(chat_id);
+
+
+-- ============================================================
+-- KICK INTEGRATION TABLES
+-- ============================================================
+
 CREATE TABLE IF NOT EXISTS kick_channels (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   slug TEXT NOT NULL,
@@ -56,6 +112,7 @@ CREATE TABLE IF NOT EXISTS kick_channels (
   UNIQUE(slug, notify_chat_id)
 );
 
+
 CREATE TABLE IF NOT EXISTS kick_stream_history (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   channel_slug TEXT NOT NULL,
@@ -66,6 +123,7 @@ CREATE TABLE IF NOT EXISTS kick_stream_history (
   category TEXT
 );
 
+
 CREATE TABLE IF NOT EXISTS kick_alert_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   channel_slug TEXT NOT NULL,
@@ -73,6 +131,7 @@ CREATE TABLE IF NOT EXISTS kick_alert_log (
   sent_at INTEGER,
   chat_id INTEGER
 );
+
 
 CREATE TABLE IF NOT EXISTS kick_drops (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,13 +142,18 @@ CREATE TABLE IF NOT EXISTS kick_drops (
   chat_id INTEGER
 );
 
+
 CREATE TABLE IF NOT EXISTS bot_config (
   key TEXT PRIMARY KEY,
   value TEXT,
   updated_at INTEGER
 );
 
--- Monitoring & health tables
+
+-- ============================================================
+-- MONITORING & HEALTH
+-- ============================================================
+
 CREATE TABLE IF NOT EXISTS bot_health_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   check_type TEXT NOT NULL,
@@ -98,6 +162,7 @@ CREATE TABLE IF NOT EXISTS bot_health_log (
   latency_ms INTEGER,
   created_at INTEGER NOT NULL
 );
+
 
 CREATE TABLE IF NOT EXISTS channel_errors (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
