@@ -1,21 +1,109 @@
 // src/services/groupIntelligence.js
 // ============================================================
-// STAKICKBOT — NATURAL GROUP PARTICIPATION
+// STAKICKBOT — ADVANCED GROUP INTELLIGENCE
+// ============================================================
+//
+// CORE FEATURES
+// ------------------------------------------------------------
+// 1. Natural autonomous participation
+// 2. Group lore + persistent long-term memory
+// 3. REPLY / WAIT / IGNORE decision system
+// 4. Telegram reply / follow-up awareness
+//
+// EXTRA FEATURES
+// ------------------------------------------------------------
+// 5. Conversation momentum detection
+// 6. Stakick self-awareness / continuity
+// 7. Dynamic participation priority
+// 8. Anti-repetition protection
+// 9. Recurring-joke memory
+// 10. Group-vibe adaptation
+// 11. Sensitive-topic handling
+// 12. Human-like micro delay
+// 13. One AI call per decision
+// 14. Smart cooldown adjustment
+// 15. Pending conversation state
+//
+// STORAGE
+// ------------------------------------------------------------
+// KV:
+//   group_ai:history:<chatId>
+//   group_ai:cooldown:<chatId>
+//   group_ai:pending:<chatId>
+//   group_ai:last_topic:<chatId>
+//   group_ai:vibe:<chatId>
+//
+// D1:
+//   group_memories
+//
+// IMPORTANT
+// ------------------------------------------------------------
+// This module intentionally makes ONE AI request for a qualifying
+// event. The model returns:
+//   action + response + memory candidate + confidence
+//
+// That is much cheaper than:
+//   decision AI call + response AI call
 // ============================================================
 
 import { queryAI } from './ai';
 import { tg } from '../telegram';
 
-const DEFAULT_COOLDOWN_MS = 10 * 60 * 1000;
-const DEFAULT_HISTORY_LIMIT = 24;
-const DEFAULT_HISTORY_TTL = 6 * 60 * 60;
-const DEFAULT_DECISION_TIMEOUT_MS = 10_000;
-const DEFAULT_RESPONSE_TIMEOUT_MS = 18_000;
+// ============================================================
+// DEFAULT CONFIG
+// ============================================================
 
-const MAX_MESSAGE_LENGTH = 1000;
-const ACTIVE_WINDOW_MS = 3 * 60 * 1000;
-const MIN_MESSAGES = 5;
-const MIN_DISTINCT_USERS = 2;
+const DEFAULT_COOLDOWN_MS =
+  10 * 60 * 1000;
+
+const DEFAULT_HISTORY_LIMIT =
+  24;
+
+const DEFAULT_HISTORY_TTL =
+  6 * 60 * 60;
+
+const DEFAULT_AI_TIMEOUT_MS =
+  20_000;
+
+const DEFAULT_ACTIVE_WINDOW_MS =
+  2 * 60 * 1000;
+
+const DEFAULT_MIN_MESSAGES =
+  3;
+
+const DEFAULT_ACTIVITY_THRESHOLD =
+  42;
+
+const DEFAULT_PENDING_MIN_WAIT_MS =
+  15_000;
+
+const DEFAULT_PENDING_MAX_WAIT_MS =
+  120_000;
+
+const DEFAULT_REPLY_PRIORITY_BONUS =
+  18;
+
+const MAX_MESSAGE_LENGTH =
+  1200;
+
+const MAX_REPLY_LENGTH =
+  900;
+
+const MAX_LORE_LENGTH =
+  500;
+
+const MAX_HISTORY_CHARS =
+  12_000;
+
+const MAX_LORE_ITEMS =
+  8;
+
+const MEMORY_SCHEMA_VERSION =
+  '2';
+
+// ============================================================
+// LANGUAGE / CONVERSATION SIGNALS
+// ============================================================
 
 const DEBATE_MARKERS = [
   'wrong',
@@ -47,8 +135,6 @@ const DEBATE_MARKERS = [
   'fact',
   'facts',
   'truth',
-  'bro what',
-  'what are you talking about',
   'you said',
   'but you',
   'but that',
@@ -59,7 +145,65 @@ const DEBATE_MARKERS = [
   'yes it is',
   'yes it does',
   'never',
-  'always'
+  'always',
+  'exactly',
+  'you mean',
+  'what do you mean',
+  'makes no sense',
+  'that makes no sense'
+];
+
+const INTEREST_MARKERS = [
+  'religion',
+  'religious',
+  'christian',
+  'christianity',
+  'muslim',
+  'islam',
+  'quran',
+  'bible',
+  'god',
+  'faith',
+  'belief',
+  'believe',
+  'politics',
+  'political',
+  'football',
+  'soccer',
+  'arsenal',
+  'chelsea',
+  'man united',
+  'man utd',
+  'liverpool',
+  'iphone',
+  'android',
+  'samsung',
+  'pixel',
+  'gaming',
+  'playstation',
+  'ps5',
+  'xbox',
+  'pc',
+  'money',
+  'crypto',
+  'school',
+  'exam',
+  'relationship',
+  'relationships',
+  'love',
+  'dating',
+  'marriage',
+  'streamer',
+  'kick',
+  'phone',
+  'laptop',
+  'gpu',
+  'cpu',
+  'ai',
+  'artificial intelligence',
+  'scam',
+  'controversial',
+  'controversy'
 ];
 
 const QUESTION_MARKERS = [
@@ -70,28 +214,87 @@ const QUESTION_MARKERS = [
   'which ',
   'who ',
   'would you ',
-  'do you '
+  'do you ',
+  'can you ',
+  'is it ',
+  'is this ',
+  'should we ',
+  'does anyone ',
+  'anyone know '
 ];
 
-function numberEnv(env, key, fallback, min, max) {
-  const n = Number(env?.[key]);
+const HUMOR_MARKERS = [
+  '😂',
+  '🤣',
+  '😭',
+  '💀',
+  'lmao',
+  'lol',
+  'haha',
+  'hahaha',
+  'brooo',
+  'broooo',
+  'wild',
+  'crazy',
+  'nahhh'
+];
 
-  if (!Number.isFinite(n)) {
+const SENSITIVE_TOPICS = [
+  'religion',
+  'religious',
+  'christian',
+  'christianity',
+  'muslim',
+  'islam',
+  'quran',
+  'bible',
+  'god',
+  'faith',
+  'politics',
+  'political',
+  'race',
+  'ethnicity'
+];
+
+// ============================================================
+// ENV HELPERS
+// ============================================================
+
+function numberEnv(
+  env,
+  key,
+  fallback,
+  min,
+  max
+) {
+  const value =
+    Number(
+      env?.[key]
+    );
+
+  if (
+    !Number.isFinite(value)
+  ) {
     return fallback;
   }
 
   return Math.min(
-    Math.max(n, min),
+    Math.max(
+      value,
+      min
+    ),
     max
   );
 }
 
 function isEnabled(env) {
-  const value = String(
-    env?.GROUP_AI_ENABLED ?? 'true'
-  )
-    .trim()
-    .toLowerCase();
+  const value =
+    String(
+      env?.GROUP_AI_ENABLED ??
+      'true'
+    )
+      .trim()
+      .toLowerCase();
 
   return ![
     '0',
@@ -102,15 +305,60 @@ function isEnabled(env) {
   ].includes(value);
 }
 
+// ============================================================
+// BASIC HELPERS
+// ============================================================
+
 function cleanMessage(text) {
-  return String(text ?? '')
+  return String(
+    text ?? ''
+  )
     .replace(/\s+/g, ' ')
     .trim()
-    .slice(0, MAX_MESSAGE_LENGTH);
+    .slice(
+      0,
+      MAX_MESSAGE_LENGTH
+    );
+}
+
+function cleanReply(text) {
+  let reply =
+    String(
+      text ?? ''
+    )
+      .trim();
+
+  reply =
+    reply
+      .replace(
+        /^```(?:text|txt|markdown)?\s*/i,
+        ''
+      )
+      .replace(
+        /```$/i,
+        ''
+      )
+      .trim();
+
+  reply =
+    reply.replace(
+      /^(assistant|stakick|bot)\s*:\s*/i,
+      ''
+    );
+
+  if (!reply) {
+    return '';
+  }
+
+  return reply.slice(
+    0,
+    MAX_REPLY_LENGTH
+  );
 }
 
 function getUserLabel(message) {
-  const from = message?.from;
+  const from =
+    message?.from;
 
   if (!from) {
     return 'Unknown';
@@ -128,15 +376,34 @@ function getUserLabel(message) {
     .join(' ')
     .trim();
 
-  return name || String(from.id || 'User');
+  return (
+    name ||
+    String(
+      from.id ||
+      'User'
+    )
+  );
 }
 
-function getHistoryKey(chatId) {
-  return `group_ai:history:${String(chatId)}`;
+function getChatId(update) {
+  return (
+    update?.message?.chat?.id ??
+    null
+  );
 }
 
-function getCooldownKey(chatId) {
-  return `group_ai:cooldown:${String(chatId)}`;
+function getUserId(update) {
+  return (
+    update?.message?.from?.id ??
+    null
+  );
+}
+
+function getMessageId(update) {
+  return (
+    update?.message?.message_id ??
+    null
+  );
 }
 
 function isGroupMessage(update) {
@@ -151,99 +418,182 @@ function isGroupMessage(update) {
 
 function looksLikeCommand(text) {
   return /^\/[A-Za-z0-9_]+/.test(
-    String(text ?? '').trim()
+    String(
+      text ?? ''
+    ).trim()
   );
 }
 
-function countDistinctUsers(history) {
-  return new Set(
-    history
-      .map((item) =>
-        String(item?.userId ?? '')
-      )
-      .filter(Boolean)
-  ).size;
+function getHistoryKey(chatId) {
+  return `group_ai:history:${String(
+    chatId
+  )}`;
 }
 
-function recentMessages(history) {
-  const cutoff =
-    Date.now() - ACTIVE_WINDOW_MS;
+function getCooldownKey(chatId) {
+  return `group_ai:cooldown:${String(
+    chatId
+  )}`;
+}
 
-  return history.filter(
-    (item) =>
-      Number(item?.timestamp || 0) >= cutoff
+function getPendingKey(chatId) {
+  return `group_ai:pending:${String(
+    chatId
+  )}`;
+}
+
+function getTopicKey(chatId) {
+  return `group_ai:last_topic:${String(
+    chatId
+  )}`;
+}
+
+function getVibeKey(chatId) {
+  return `group_ai:vibe:${String(
+    chatId
+  )}`;
+}
+
+function getSchemaKey() {
+  return `group_ai:schema:v${MEMORY_SCHEMA_VERSION}`;
+}
+
+function escapeRegex(text) {
+  return String(
+    text ?? ''
+  ).replace(
+    /[.*+?^${}()|[\]\\]/g,
+    '\\$&'
   );
 }
 
-function scoreConversation(
-  history,
-  currentText
+function botMentioned(
+  text,
+  botUsername
 ) {
-  const recent =
-    recentMessages(history);
+  if (!botUsername) {
+    return false;
+  }
+
+  return new RegExp(
+    `@${escapeRegex(
+      botUsername
+    )}\\b`,
+    'i'
+  ).test(text);
+}
+
+function containsSensitiveTopic(
+  text
+) {
+  const lower =
+    String(
+      text ?? ''
+    ).toLowerCase();
+
+  return SENSITIVE_TOPICS.some(
+    (topic) =>
+      lower.includes(topic)
+  );
+}
+
+// ============================================================
+// REPLY / FOLLOW-UP AWARENESS
+// ============================================================
+
+function getReplyContext(
+  message
+) {
+  const replied =
+    message?.reply_to_message;
+
+  if (!replied) {
+    return null;
+  }
+
+  const repliedText =
+    cleanMessage(
+      replied?.text ||
+      replied?.caption ||
+      ''
+    );
+
+  return {
+    messageId:
+      replied?.message_id ??
+      null,
+
+    userId:
+      replied?.from?.id ??
+      null,
+
+    username:
+      replied?.from?.username
+        ? `@${replied.from.username}`
+        : [
+            replied?.from?.first_name,
+            replied?.from?.last_name
+          ]
+            .filter(Boolean)
+            .join(' ')
+            .trim() ||
+          'User',
+
+    isBot:
+      Boolean(
+        replied?.from?.is_bot
+      ),
+
+    text:
+      repliedText
+  };
+}
+
+function isReplyToStakick(
+  replyContext,
+  botUsername
+) {
+  if (!replyContext) {
+    return false;
+  }
 
   if (
-    recent.length < MIN_MESSAGES ||
-    countDistinctUsers(recent) <
-      MIN_DISTINCT_USERS
+    replyContext.isBot
   ) {
-    return 0;
+    return true;
   }
 
-  let score = 0;
-
-  score += Math.min(
-    40,
-    recent.length * 4
-  );
-
-  score += Math.min(
-    25,
-    countDistinctUsers(recent) * 8
-  );
-
-  const corpus = [
-    ...recent.map(
-      (item) => item.text
-    ),
-    currentText
-  ]
-    .join(' ')
-    .toLowerCase();
-
-  for (const marker of DEBATE_MARKERS) {
-    if (corpus.includes(marker)) {
-      score += 3;
-    }
-  }
-
-  for (
-    const marker of QUESTION_MARKERS
+  if (
+    botUsername &&
+    String(
+      replyContext.username ||
+      ''
+    )
+      .toLowerCase() ===
+      `@${String(
+        botUsername
+      ).toLowerCase()}`
   ) {
-    if (corpus.includes(marker)) {
-      score += 2;
-    }
+    return true;
   }
 
-  const lastFour =
-    recent.slice(-4);
+  return false;
+}
 
-  if (lastFour.length >= 4) {
-    const participants =
-      new Set(
-        lastFour.map((item) =>
-          String(item.userId ?? '')
-        )
-      );
+// ============================================================
+// HISTORY
+// ============================================================
 
-    if (participants.size >= 2) {
-      score += 15;
-    }
+function trimHistory(
+  history,
+  limit
+) {
+  if (!Array.isArray(history)) {
+    return [];
   }
 
-  return Math.min(
-    100,
-    score
+  return history.slice(
+    -limit
   );
 }
 
@@ -251,7 +601,7 @@ async function loadHistory(
   env,
   chatId,
   limit,
-  ttl
+  ttlSeconds
 ) {
   if (!env?.KV) {
     return [];
@@ -262,74 +612,367 @@ async function loadHistory(
       getHistoryKey(chatId)
     );
 
+  if (!raw) {
+    return [];
+  }
+
   let history = [];
 
   try {
-    history = raw
-      ? JSON.parse(raw)
-      : [];
+    history =
+      JSON.parse(raw);
   } catch {
-    history = [];
+    return [];
   }
 
   if (!Array.isArray(history)) {
-    history = [];
+    return [];
   }
 
   const cutoff =
     Date.now() -
     Math.min(
-      ttl * 1000,
+      Number(ttlSeconds) * 1000,
       24 * 60 * 60 * 1000
     );
 
-  history =
+  return trimHistory(
     history.filter(
       (item) =>
-        Number(item?.timestamp || 0) >=
-        cutoff
-    );
-
-  return history.slice(-limit);
+        Number(
+          item?.timestamp || 0
+        ) >= cutoff
+    ),
+    limit
+  );
 }
 
 async function saveHistory(
   env,
   chatId,
   history,
-  ttl
+  limit,
+  ttlSeconds
 ) {
   if (!env?.KV) {
     return;
   }
 
-  const safeHistory =
-    Array.isArray(history)
-      ? history.slice(
-          -DEFAULT_HISTORY_LIMIT
-        )
-      : [];
+  const safe =
+    trimHistory(
+      history,
+      limit
+    );
 
   await env.KV.put(
     getHistoryKey(chatId),
-    JSON.stringify(safeHistory),
+    JSON.stringify(safe),
     {
       expirationTtl:
         Math.max(
           60,
-          Math.floor(ttl)
+          Math.floor(
+            ttlSeconds
+          )
         )
     }
   );
 }
 
-async function cooldownActive(
+function formatHistory(
+  history
+) {
+  const lines =
+    history.map(
+      (item) => {
+        const speaker =
+          String(
+            item?.username ||
+            item?.firstName ||
+            'User'
+          ).trim();
+
+        const label =
+          item?.isBot
+            ? `Stakick (${speaker})`
+            : speaker;
+
+        const text =
+          cleanMessage(
+            item?.text
+          );
+
+        if (!text) {
+          return '';
+        }
+
+        return `${label}: ${text}`;
+      }
+    );
+
+  return lines
+    .filter(Boolean)
+    .join('\n')
+    .slice(
+      -MAX_HISTORY_CHARS
+    );
+}
+
+// ============================================================
+// ACTIVITY / MOMENTUM
+// ============================================================
+
+function recentMessages(
+  history,
+  activeWindowMs
+) {
+  const cutoff =
+    Date.now() -
+    activeWindowMs;
+
+  return history.filter(
+    (item) =>
+      Number(
+        item?.timestamp || 0
+      ) >= cutoff
+  );
+}
+
+function countDistinctUsers(
+  history
+) {
+  return new Set(
+    history
+      .map(
+        (item) =>
+          String(
+            item?.userId ?? ''
+          )
+      )
+      .filter(Boolean)
+  ).size;
+}
+
+function countMatches(
+  text,
+  markers
+) {
+  const lower =
+    String(
+      text ?? ''
+    ).toLowerCase();
+
+  let count = 0;
+
+  for (
+    const marker of markers
+  ) {
+    if (
+      lower.includes(marker)
+    ) {
+      count++;
+    }
+  }
+
+  return count;
+}
+
+function calculateMomentum(
+  recent
+) {
+  if (
+    recent.length < 2
+  ) {
+    return 0;
+  }
+
+  const timestamps =
+    recent
+      .map(
+        (item) =>
+          Number(
+            item?.timestamp || 0
+          )
+      )
+      .filter(
+        Number.isFinite
+      )
+      .sort(
+        (a, b) => a - b
+      );
+
+  if (
+    timestamps.length < 2
+  ) {
+    return 0;
+  }
+
+  const gaps = [];
+
+  for (
+    let i = 1;
+    i < timestamps.length;
+    i++
+  ) {
+    gaps.push(
+      timestamps[i] -
+        timestamps[i - 1]
+    );
+  }
+
+  const avgGap =
+    gaps.reduce(
+      (sum, gap) =>
+        sum + gap,
+      0
+    ) /
+    gaps.length;
+
+  if (
+    avgGap <= 5_000
+  ) {
+    return 30;
+  }
+
+  if (
+    avgGap <= 10_000
+  ) {
+    return 24;
+  }
+
+  if (
+    avgGap <= 20_000
+  ) {
+    return 18;
+  }
+
+  if (
+    avgGap <= 40_000
+  ) {
+    return 10;
+  }
+
+  return 4;
+}
+
+function scoreConversation(
+  history,
+  currentText,
+  activeWindowMs,
+  minMessages,
+  replyPriority
+) {
+  const recent =
+    recentMessages(
+      history,
+      activeWindowMs
+    );
+
+  const distinct =
+    countDistinctUsers(
+      recent
+    );
+
+  if (
+    recent.length <
+      minMessages ||
+    distinct < 2
+  ) {
+    if (replyPriority) {
+      return Math.min(
+        100,
+        30 +
+          DEFAULT_REPLY_PRIORITY_BONUS
+      );
+    }
+
+    return 0;
+  }
+
+  let score = 0;
+
+  score += Math.min(
+    28,
+    recent.length * 7
+  );
+
+  score += Math.min(
+    24,
+    distinct * 12
+  );
+
+  const corpus = [
+    ...recent.map(
+      (item) =>
+        item?.text || ''
+    ),
+    currentText
+  ]
+    .join(' ')
+    .toLowerCase();
+
+  score += Math.min(
+    20,
+    countMatches(
+      corpus,
+      DEBATE_MARKERS
+    ) * 4
+  );
+
+  score += Math.min(
+    16,
+    countMatches(
+      corpus,
+      INTEREST_MARKERS
+    ) * 4
+  );
+
+  score += Math.min(
+    10,
+    countMatches(
+      corpus,
+      QUESTION_MARKERS
+    ) * 2
+  );
+
+  score += Math.min(
+    30,
+    calculateMomentum(
+      recent
+    )
+  );
+
+  score += Math.min(
+    12,
+    countMatches(
+      corpus,
+      HUMOR_MARKERS
+    ) * 3
+  );
+
+  if (
+    replyPriority
+  ) {
+    score +=
+      DEFAULT_REPLY_PRIORITY_BONUS;
+  }
+
+  return Math.min(
+    100,
+    score
+  );
+}
+
+// ============================================================
+// COOLDOWN
+// ============================================================
+
+async function loadLastBotTime(
   env,
-  chatId,
-  cooldownMs
+  chatId
 ) {
   if (!env?.KV) {
-    return false;
+    return null;
   }
 
   const raw =
@@ -338,18 +981,37 @@ async function cooldownActive(
     );
 
   if (!raw) {
-    return false;
+    return null;
   }
 
-  const last =
+  const timestamp =
     Number(raw);
 
-  if (!Number.isFinite(last)) {
+  return Number.isFinite(
+    timestamp
+  )
+    ? timestamp
+    : null;
+}
+
+async function cooldownActive(
+  env,
+  chatId,
+  cooldownMs
+) {
+  const last =
+    await loadLastBotTime(
+      env,
+      chatId
+    );
+
+  if (!last) {
     return false;
   }
 
   return (
-    Date.now() - last <
+    Date.now() -
+      last <
     cooldownMs
   );
 }
@@ -363,236 +1025,1160 @@ async function setCooldown(
     return;
   }
 
-  const ttl =
-    Math.max(
-      60,
-      Math.ceil(
-        cooldownMs / 1000
-      )
-    );
-
   await env.KV.put(
     getCooldownKey(chatId),
     String(Date.now()),
     {
-      expirationTtl: ttl
+      expirationTtl:
+        Math.max(
+          60,
+          Math.ceil(
+            cooldownMs / 1000
+          )
+        )
     }
   );
 }
 
-function formatHistory(history) {
-  return history
-    .map((item) => {
-      const speaker =
-        String(
-          item?.username ||
-          item?.firstName ||
-          'User'
-        ).trim();
+// ============================================================
+// PENDING WAIT STATE
+// ============================================================
 
-      const text =
-        cleanMessage(item?.text);
+async function loadPending(
+  env,
+  chatId
+) {
+  if (!env?.KV) {
+    return null;
+  }
 
-      return `${speaker}: ${text}`;
-    })
-    .filter(Boolean)
-    .join('\n');
-}
-
-function parseDecision(text) {
   const raw =
-    String(text ?? '')
-      .trim()
-      .replace(
-        /^```json\s*/i,
-        ''
-      )
-      .replace(
-        /^```\s*/i,
-        ''
-      )
-      .replace(
-        /```$/i,
-        ''
-      )
-      .trim();
+    await env.KV.get(
+      getPendingKey(chatId)
+    );
+
+  if (!raw) {
+    return null;
+  }
 
   try {
-    const parsed =
-      JSON.parse(raw);
-
-    return {
-      shouldSpeak:
-        Boolean(
-          parsed?.shouldSpeak
-        ),
-      style:
-        String(
-          parsed?.style || ''
-        )
-          .trim()
-          .slice(0, 40),
-      reason:
-        String(
-          parsed?.reason || ''
-        )
-          .trim()
-          .slice(0, 250)
-    };
+    return JSON.parse(
+      raw
+    );
   } catch {
-    const match =
-      raw.match(
-        /"shouldSpeak"\s*:\s*(true|false)/i
-      );
-
-    return {
-      shouldSpeak:
-        match?.[1]?.toLowerCase() ===
-        'true',
-      style: '',
-      reason:
-        'Decision parser fallback'
-    };
+    return null;
   }
 }
 
-function cleanAIReply(text) {
-  let reply =
-    String(text ?? '').trim();
-
-  reply =
-    reply
-      .replace(
-        /^```[a-z]*\s*/i,
-        ''
-      )
-      .replace(
-        /```$/i,
-        ''
-      )
-      .trim();
-
-  reply =
-    reply
-      .replace(
-        /^(assistant|stakick|bot)\s*:\s*/i,
-        ''
-      )
-      .trim();
-
-  if (!reply) {
-    return '';
+async function savePending(
+  env,
+  chatId,
+  pending,
+  maxWaitMs
+) {
+  if (!env?.KV) {
+    return;
   }
 
-  return reply.slice(
-    0,
-    900
+  await env.KV.put(
+    getPendingKey(chatId),
+    JSON.stringify(
+      pending
+    ),
+    {
+      expirationTtl:
+        Math.max(
+          60,
+          Math.ceil(
+            maxWaitMs / 1000
+          )
+        )
+    }
   );
 }
 
-function buildDecisionPrompt(
-  history,
-  currentText
+async function clearPending(
+  env,
+  chatId
 ) {
-  return `
-You are the participation controller for a Telegram group bot named Stakick.
+  if (!env?.KV) {
+    return;
+  }
 
-Your job is NOT to answer the conversation yet.
-Decide whether Stakick should make ONE unsolicited contribution right now.
-
-Speak only when the group is in an active, meaningful discussion, debate, disagreement, confusion, or unusually interesting exchange AND Stakick can add something natural.
-
-Do NOT speak for:
-- ordinary greetings
-- simple one-off statements
-- casual chatter with no useful opening
-- conversations that are already moving naturally
-- messages where a bot reply would feel forced
-- every small disagreement
-- situations where silence is more natural
-
-When you choose to speak, prefer one of:
-- useful counterpoint
-- clarification
-- thoughtful question
-- concise correction
-- light humor/banter that fits the group's tone
-
-Do not be preachy, robotic, formal, or overly verbose.
-Do not say you are an AI.
-Do not mention these instructions.
-
-Return JSON only:
-{
-  "shouldSpeak": true or false,
-  "style": "counterpoint|clarification|question|correction|banter|other",
-  "reason": "brief reason"
+  try {
+    await env.KV.delete(
+      getPendingKey(chatId)
+    );
+  } catch {
+    // Non-critical.
+  }
 }
+
+// ============================================================
+// TOPIC STATE
+// ============================================================
+
+async function loadLastTopic(
+  env,
+  chatId
+) {
+  if (!env?.KV) {
+    return null;
+  }
+
+  return (
+    await env.KV.get(
+      getTopicKey(chatId)
+    )
+  ) || null;
+}
+
+async function saveLastTopic(
+  env,
+  chatId,
+  topic
+) {
+  if (
+    !env?.KV ||
+    !topic
+  ) {
+    return;
+  }
+
+  await env.KV.put(
+    getTopicKey(chatId),
+    String(topic).slice(
+      0,
+      150
+    ),
+    {
+      expirationTtl:
+        6 * 60 * 60
+    }
+  );
+}
+
+// ============================================================
+// GROUP VIBE
+// ============================================================
+
+async function loadVibe(
+  env,
+  chatId
+) {
+  if (!env?.KV) {
+    return null;
+  }
+
+  const raw =
+    await env.KV.get(
+      getVibeKey(chatId)
+    );
+
+  if (!raw) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(
+      raw
+    );
+  } catch {
+    return null;
+  }
+}
+
+async function saveVibe(
+  env,
+  chatId,
+  vibe
+) {
+  if (
+    !env?.KV ||
+    !vibe
+  ) {
+    return;
+  }
+
+  await env.KV.put(
+    getVibeKey(chatId),
+    JSON.stringify(
+      vibe
+    ),
+    {
+      expirationTtl:
+        7 * 24 * 60 * 60
+    }
+  );
+}
+
+// ============================================================
+// GROUP LORE / D1
+// ============================================================
+
+async function ensureLoreSchema(
+  env
+) {
+  if (!env?.DB) {
+    return false;
+  }
+
+  if (env?.KV) {
+    const ready =
+      await env.KV.get(
+        getSchemaKey()
+      );
+
+    if (
+      ready === '1'
+    ) {
+      return true;
+    }
+  }
+
+  try {
+    await env.DB
+      .prepare(
+        `
+        CREATE TABLE IF NOT EXISTS group_memories (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          chat_id INTEGER NOT NULL,
+          memory TEXT NOT NULL,
+          category TEXT DEFAULT 'group_fact',
+          importance REAL DEFAULT 0.60,
+          source_user_id INTEGER,
+          created_at INTEGER NOT NULL,
+          last_used_at INTEGER,
+          use_count INTEGER DEFAULT 0
+        )
+        `
+      )
+      .run();
+
+    await env.DB
+      .prepare(
+        `
+        CREATE INDEX IF NOT EXISTS
+        idx_group_memories_chat
+        ON group_memories(chat_id)
+        `
+      )
+      .run();
+
+    if (env?.KV) {
+      await env.KV.put(
+        getSchemaKey(),
+        '1',
+        {
+          expirationTtl:
+            7 * 24 * 60 * 60
+        }
+      );
+    }
+
+    return true;
+  } catch (error) {
+    console.error(
+      'Group lore schema setup failed:',
+      error?.message ||
+        error
+    );
+
+    return false;
+  }
+}
+
+async function loadGroupLore(
+  env,
+  chatId,
+  limit = MAX_LORE_ITEMS
+) {
+  if (!env?.DB) {
+    return [];
+  }
+
+  try {
+    const result =
+      await env.DB
+        .prepare(
+          `
+          SELECT
+            id,
+            memory,
+            category,
+            importance,
+            source_user_id,
+            created_at,
+            last_used_at,
+            use_count
+          FROM group_memories
+          WHERE chat_id = ?
+          ORDER BY
+            importance DESC,
+            COALESCE(last_used_at, 0) DESC,
+            created_at DESC
+          LIMIT ?
+          `
+        )
+        .bind(
+          chatId,
+          limit
+        )
+        .all();
+
+    return (
+      result?.results ||
+      []
+    );
+  } catch (error) {
+    console.error(
+      'Group lore load failed:',
+      error?.message ||
+        error
+    );
+
+    return [];
+  }
+}
+
+async function saveGroupMemory(
+  env,
+  {
+    chatId,
+    userId,
+    memory,
+    category,
+    importance
+  }
+) {
+  if (
+    !env?.DB ||
+    !memory
+  ) {
+    return null;
+  }
+
+  const cleaned =
+    String(memory)
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(
+        0,
+        MAX_LORE_LENGTH
+      );
+
+  if (
+    cleaned.length < 8
+  ) {
+    return null;
+  }
+
+  const safeImportance =
+    Math.min(
+      1,
+      Math.max(
+        0.10,
+        Number(
+          importance ??
+          0.60
+        )
+      )
+    );
+
+  const safeCategory =
+    String(
+      category ||
+      'group_fact'
+    )
+      .trim()
+      .slice(
+        0,
+        40
+      ) ||
+    'group_fact';
+
+  try {
+    const duplicate =
+      await env.DB
+        .prepare(
+          `
+          SELECT
+            id,
+            memory,
+            importance
+          FROM group_memories
+          WHERE chat_id = ?
+            AND LOWER(memory) =
+                LOWER(?)
+          LIMIT 1
+          `
+        )
+        .bind(
+          chatId,
+          cleaned
+        )
+        .first();
+
+    if (
+      duplicate?.id
+    ) {
+      await env.DB
+        .prepare(
+          `
+          UPDATE group_memories
+          SET
+            importance = MAX(
+              importance,
+              ?
+            ),
+            last_used_at = ?,
+            use_count =
+              COALESCE(use_count, 0) + 1
+          WHERE id = ?
+          `
+        )
+        .bind(
+          safeImportance,
+          Date.now(),
+          duplicate.id
+        )
+        .run();
+
+      return Number(
+        duplicate.id
+      );
+    }
+
+    const result =
+      await env.DB
+        .prepare(
+          `
+          INSERT INTO group_memories
+          (
+            chat_id,
+            memory,
+            category,
+            importance,
+            source_user_id,
+            created_at,
+            last_used_at,
+            use_count
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+          `
+        )
+        .bind(
+          chatId,
+          cleaned,
+          safeCategory,
+          safeImportance,
+          userId ??
+            null,
+          Date.now(),
+          Date.now()
+        )
+        .run();
+
+    return Number(
+      result?.meta
+        ?.last_row_id || 0
+    );
+  } catch (error) {
+    console.error(
+      'Group lore save failed:',
+      error?.message ||
+        error
+    );
+
+    return null;
+  }
+}
+
+async function markLoreUsed(
+  env,
+  ids
+) {
+  if (
+    !env?.DB ||
+    !Array.isArray(ids) ||
+    ids.length === 0
+  ) {
+    return;
+  }
+
+  for (
+    const id of ids
+  ) {
+    try {
+      await env.DB
+        .prepare(
+          `
+          UPDATE group_memories
+          SET
+            last_used_at = ?,
+            use_count =
+              COALESCE(use_count, 0) + 1
+          WHERE id = ?
+          `
+        )
+        .bind(
+          Date.now(),
+          id
+        )
+        .run();
+    } catch {
+      // Non-critical.
+    }
+  }
+}
+
+// ============================================================
+// AI OUTPUT PARSER
+// ============================================================
+
+function stripCodeFence(
+  text
+) {
+  return String(
+    text ?? ''
+  )
+    .trim()
+    .replace(
+      /^```json\s*/i,
+      ''
+    )
+    .replace(
+      /^```\s*/i,
+      ''
+    )
+    .replace(
+      /```$/i,
+      ''
+    )
+    .trim();
+}
+
+function normalizeDecision(
+  parsed
+) {
+  let action =
+    String(
+      parsed?.action ||
+      ''
+    )
+      .trim()
+      .toUpperCase();
+
+  if (
+    ![
+      'REPLY',
+      'WAIT',
+      'IGNORE'
+    ].includes(action)
+  ) {
+    action =
+      parsed?.shouldSpeak
+        ? 'REPLY'
+        : 'IGNORE';
+  }
+
+  const confidence =
+    Math.min(
+      1,
+      Math.max(
+        0,
+        Number(
+          parsed?.confidence ??
+          0
+        )
+      )
+    );
+
+  const reply =
+    cleanReply(
+      parsed?.reply ||
+      ''
+    );
+
+  const memory =
+    parsed?.memory &&
+    typeof parsed.memory ===
+      'object'
+      ? {
+          remember:
+            Boolean(
+              parsed.memory
+                ?.remember
+            ),
+
+          text:
+            String(
+              parsed.memory
+                ?.text ||
+              ''
+            )
+              .trim()
+              .slice(
+                0,
+                MAX_LORE_LENGTH
+              ),
+
+          category:
+            String(
+              parsed.memory
+                ?.category ||
+              'group_fact'
+            )
+              .trim()
+              .slice(
+                0,
+                40
+              ),
+
+          importance:
+            Math.min(
+              1,
+              Math.max(
+                0.10,
+                Number(
+                  parsed.memory
+                    ?.importance ??
+                  0.60
+                )
+              )
+            )
+        }
+      : null;
+
+  const waitSeconds =
+    Math.min(
+      120,
+      Math.max(
+        15,
+        Number(
+          parsed?.waitSeconds ??
+          30
+        )
+      )
+    );
+
+  const vibe =
+    parsed?.vibe &&
+    typeof parsed.vibe ===
+      'object'
+      ? {
+          humor:
+            clampNumber(
+              parsed.vibe
+                ?.humor,
+              0.5
+            ),
+
+          seriousness:
+            clampNumber(
+              parsed.vibe
+                ?.seriousness,
+              0.5
+            ),
+
+          banter:
+            clampNumber(
+              parsed.vibe
+                ?.banter,
+              0.5
+            ),
+
+          energy:
+            clampNumber(
+              parsed.vibe
+                ?.energy,
+              0.5
+            )
+        }
+      : null;
+
+  const topic =
+    String(
+      parsed?.topic ||
+      ''
+    )
+      .trim()
+      .slice(
+        0,
+        150
+      );
+
+  return {
+    action,
+    confidence,
+
+    reason:
+      String(
+        parsed?.reason ||
+        ''
+      )
+        .trim()
+        .slice(
+          0,
+          300
+        ),
+
+    reply,
+
+    memory,
+
+    waitSeconds,
+
+    topic,
+
+    vibe,
+
+    loreIds:
+      Array.isArray(
+        parsed?.loreIds
+      )
+        ? parsed.loreIds
+            .map(
+              Number
+            )
+            .filter(
+              Number.isFinite
+            )
+        : []
+  };
+}
+
+function clampNumber(
+  value,
+  fallback
+) {
+  const n =
+    Number(value);
+
+  if (
+    !Number.isFinite(n)
+  ) {
+    return fallback;
+  }
+
+  return Math.min(
+    1,
+    Math.max(
+      0,
+      n
+    )
+  );
+}
+
+function parseDecision(
+  text
+) {
+  const raw =
+    stripCodeFence(
+      text
+    );
+
+  try {
+    return normalizeDecision(
+      JSON.parse(raw)
+    );
+  } catch {
+    // Continue.
+  }
+
+  const start =
+    raw.indexOf('{');
+
+  const end =
+    raw.lastIndexOf('}');
+
+  if (
+    start >= 0 &&
+    end > start
+  ) {
+    try {
+      return normalizeDecision(
+        JSON.parse(
+          raw.slice(
+            start,
+            end + 1
+          )
+        )
+      );
+    } catch {
+      // Continue.
+    }
+  }
+
+  return {
+    action:
+      'IGNORE',
+
+    confidence:
+      0,
+
+    reason:
+      'Invalid AI response',
+
+    reply:
+      '',
+
+    memory:
+      null,
+
+    waitSeconds:
+      30,
+
+    topic:
+      '',
+
+    vibe:
+      null,
+
+    loreIds:
+      []
+  };
+}
+
+// ============================================================
+// AI PROMPT
+// ============================================================
+
+function buildAutonomousPrompt({
+  history,
+  currentText,
+  currentUsername,
+  replyContext,
+  replyToStakick,
+  lore,
+  previousTopic,
+  vibe,
+  activityScore,
+  sensitive
+}) {
+  const loreText =
+    lore.length > 0
+      ? lore
+          .map(
+            (item) =>
+              `- [id=${item.id}] [${item.category || 'group_fact'}] ${item.memory}`
+          )
+          .join('\n')
+      : '- No persistent group lore yet.';
+
+  const replyText =
+    replyContext
+      ? `
+TELEGRAM REPLY CONTEXT:
+The current message is replying to:
+${replyContext.isBot ? 'Stakick' : replyContext.username}: ${replyContext.text}
+
+Directly replying to Stakick:
+${replyToStakick ? 'YES' : 'NO'}
+`
+      : `
+TELEGRAM REPLY CONTEXT:
+No direct reply-to-message was provided.
+`;
+
+  const vibeText =
+    vibe
+      ? `
+CURRENT GROUP VIBE ESTIMATE:
+- humor: ${vibe.humor}
+- seriousness: ${vibe.seriousness}
+- banter: ${vibe.banter}
+- energy: ${vibe.energy}
+`
+      : `
+CURRENT GROUP VIBE:
+Unknown. Infer it from the conversation.
+`;
+
+  return `
+You are Stakick, an actual-feeling member of a Telegram group.
+
+You are participating naturally in an ongoing group conversation.
+
+You are NOT required to speak.
+
+Your three possible actions are:
+
+REPLY
+WAIT
+IGNORE
+
+============================================================
+CORE BEHAVIOR
+============================================================
+
+Choose REPLY when Stakick can genuinely improve the conversation.
+
+Choose WAIT when the conversation is developing and another
+message or two may provide better context.
+
+Choose IGNORE when participating would feel forced, unnecessary,
+repetitive, annoying, or out of place.
+
+Do not insert yourself into every discussion.
+
+Do not act like an assistant waiting for instructions.
+
+Do not say:
+- "As an AI"
+- "As a bot"
+- "I am an AI"
+- "I understand your request"
+- "How can I assist?"
+- "Certainly"
+
+Speak like a normal member of the group.
+
+============================================================
+FOLLOW-UP AWARENESS
+============================================================
+
+If somebody is replying directly to Stakick, pay special attention.
+
+If the current message answers, challenges, jokes about, questions,
+or continues something Stakick previously said, Stakick can choose
+REPLY even when the general group activity is moderate.
+
+Do not treat a direct reply as a brand-new unrelated conversation.
+
+Continue the thread naturally.
+
+Do not repeat Stakick's previous point.
+
+============================================================
+CONVERSATION MOMENTUM
+============================================================
+
+Pay attention to:
+- message frequency
+- multiple participants
+- disagreement
+- questions
+- jokes
+- emotional energy
+- whether the conversation is escalating
+- whether the current message opens a new topic
+- whether people are already answering each other naturally
+
+If the group is still developing a topic, WAIT can be better than
+an immediate interruption.
+
+============================================================
+GROUP LORE
+============================================================
+
+The group may have recurring jokes, nicknames, traditions,
+preferences, memorable events, and personality patterns.
+
+Existing lore:
+${loreText}
+
+Use lore only when genuinely relevant.
+
+Do NOT force an inside joke into unrelated conversation.
+
+You may propose ONE new memory only when it is genuinely useful
+in future conversations.
+
+Good memories:
+- recurring inside jokes
+- stable nicknames
+- recurring group traditions
+- long-running group preferences
+- meaningful recurring member dynamics
+- memorable group events
+
+Do NOT store:
+- random one-off statements
+- temporary emotions
+- passwords
+- secrets
+- private financial information
+- sensitive personal data
+- sensitive traits
+- medical information
+- political or religious identity as a personal profile
+- anything that would be creepy to remember
+
+============================================================
+GROUP VIBE
+============================================================
+
+Use the current group's style.
+
+If people are joking, be playful.
+
+If people are debating seriously, be thoughtful.
+
+If people are excited, match the energy.
+
+If people are angry, do not deliberately inflame them.
+
+Light teasing is allowed when it is clearly playful.
+
+============================================================
+SENSITIVE TOPICS
+============================================================
+
+Sensitive topic detected:
+${sensitive ? 'YES' : 'NO'}
+
+For religion, politics, identity, or other sensitive discussions:
+- discuss ideas rather than attacking people
+- do not mock someone's beliefs
+- do not deliberately provoke
+- do not present unsupported claims as facts
+- do not encourage hostility
+- staying silent is better than making things worse
+
+============================================================
+RESPONSE STYLE
+============================================================
+
+Keep autonomous responses concise.
+
+Normally:
+1-4 sentences.
+
+Sometimes one sentence is perfect.
+
+Do not write essays.
+
+Avoid generic filler.
+
+Good:
+"😂 You two are actually arguing about completely different things."
+
+Good:
+"Wait, that's a different question entirely."
+
+Good:
+"Okay but what would actually change your mind?"
+
+Bad:
+"Both sides have valid perspectives and it is important to
+understand that every situation is nuanced."
+
+============================================================
+TOKEN ECONOMY
+============================================================
+
+Only provide a response when it is worth sending.
+
+Do not repeat recent points.
+
+Do not restate the whole conversation.
+
+Do not manufacture disagreement just to participate.
+
+============================================================
+CURRENT CONTEXT
+============================================================
+
+Activity score:
+${activityScore}
+
+Previous topic:
+${previousTopic || 'Unknown'}
+
+${vibeText}
 
 RECENT GROUP CONVERSATION:
 <context>
-${formatHistory(history)}
+${history}
 </context>
+
+${replyText}
+
+CURRENT SPEAKER:
+${currentUsername}
 
 CURRENT MESSAGE:
 <current>
 ${currentText}
 </current>
+
+============================================================
+RETURN JSON ONLY
+============================================================
+
+{
+  "action": "REPLY|WAIT|IGNORE",
+  "confidence": 0.00,
+  "reason": "brief reason",
+  "reply": "message to send if action is REPLY",
+  "waitSeconds": 30,
+  "topic": "short current topic",
+  "vibe": {
+    "humor": 0.0,
+    "seriousness": 0.0,
+    "banter": 0.0,
+    "energy": 0.0
+  },
+  "memory": {
+    "remember": false,
+    "text": "",
+    "category": "group_fact",
+    "importance": 0.60
+  },
+  "loreIds": []
+}
+
+Rules:
+- If action is IGNORE, reply should be empty.
+- If action is WAIT, reply should be empty.
+- If action is REPLY, reply must be the exact message Stakick should send.
+- Keep memory.remember false unless memory is genuinely useful.
+- loreIds should contain IDs of existing lore actually used.
 `.trim();
 }
 
-function buildResponsePrompt(
-  history,
-  currentText,
-  username
+// ============================================================
+// NATURAL DELAY
+// ============================================================
+
+function randomReplyDelayMs(
+  priority
 ) {
-  return `
-You are Stakick, a natural and socially aware member of a Telegram group.
+  if (
+    priority >= 85
+  ) {
+    return (
+      800 +
+      Math.floor(
+        Math.random() *
+        1800
+      )
+    );
+  }
 
-The group is currently having an active discussion. Join the conversation naturally.
-
-Your message MUST:
-- directly fit the current discussion
-- be concise, normally 1-4 sentences
-- sound like a real group member, not an assistant
-- match the group's informal tone
-- add something useful, funny, clarifying, or thought-provoking
-- avoid repeating what someone just said
-
-You MAY:
-- challenge an argument respectfully
-- point out that two people are arguing about different things
-- ask a sharp follow-up question
-- give a concise correction
-- make a light joke if appropriate
-
-You MUST NOT:
-- announce yourself
-- mention being an AI/bot
-- say "as an AI"
-- use corporate/formal language
-- lecture people
-- take a side just to create conflict
-- invent facts
-- produce a long essay
-
-Reply as though you spontaneously decided to jump into the conversation.
-
-The latest speaker is ${username}.
-
-RECENT CONVERSATION:
-<context>
-${formatHistory(history)}
-</context>
-
-LATEST MESSAGE:
-<current>
-${currentText}
-</current>
-
-Return ONLY the message Stakick should send.
-`.trim();
+  return (
+    1200 +
+    Math.floor(
+      Math.random() *
+      2800
+    )
+  );
 }
+
+function sleep(ms) {
+  return new Promise(
+    (resolve) =>
+      setTimeout(
+        resolve,
+        ms
+      )
+  );
+}
+
+// ============================================================
+// MAIN
+// ============================================================
 
 export async function handleGroupParticipation(
   env,
@@ -602,24 +2188,37 @@ export async function handleGroupParticipation(
   } = {}
 ) {
   try {
+    // ----------------------------------------------------------
+    // ENABLE CHECK
+    // ----------------------------------------------------------
+
     if (!isEnabled(env)) {
       return {
         spoke: false,
-        reason: 'disabled'
+        reason:
+          'disabled'
       };
     }
 
     if (!env?.KV) {
       return {
         spoke: false,
-        reason: 'KV unavailable'
+        reason:
+          'KV unavailable'
       };
     }
 
-    if (!isGroupMessage(update)) {
+    // ----------------------------------------------------------
+    // GROUP ONLY
+    // ----------------------------------------------------------
+
+    if (
+      !isGroupMessage(update)
+    ) {
       return {
         spoke: false,
-        reason: 'not a group message'
+        reason:
+          'not a group message'
       };
     }
 
@@ -632,64 +2231,85 @@ export async function handleGroupParticipation(
     ) {
       return {
         spoke: false,
-        reason: 'bot/service message'
+        reason:
+          'bot/service message'
       };
     }
 
+    // ----------------------------------------------------------
+    // MESSAGE TEXT
+    // ----------------------------------------------------------
+
     const text =
       cleanMessage(
-        message?.text
+        message?.text ||
+        message?.caption ||
+        ''
       );
 
     if (!text) {
       return {
         spoke: false,
-        reason: 'no text'
-      };
-    }
-
-    if (looksLikeCommand(text)) {
-      return {
-        spoke: false,
-        reason: 'command'
+        reason:
+          'no text'
       };
     }
 
     if (
-      botUsername &&
-      new RegExp(
-        `@${String(
-          botUsername
-        ).replace(
-          /[.*+?^${}()|[\]\\]/g,
-          '\\$&'
-        )}\\b`,
-        'i'
-      ).test(text)
+      looksLikeCommand(text)
     ) {
       return {
         spoke: false,
-        reason: 'direct bot mention'
+        reason:
+          'command'
       };
     }
+
+    /*
+     * Direct @Stakick mentions already use the normal AI path.
+     */
+    if (
+      botMentioned(
+        text,
+        botUsername
+      )
+    ) {
+      return {
+        spoke: false,
+        reason:
+          'direct bot mention'
+      };
+    }
+
+    // ----------------------------------------------------------
+    // IDS
+    // ----------------------------------------------------------
 
     const chatId =
-      message?.chat?.id;
+      getChatId(update);
 
     const userId =
-      message?.from?.id;
+      getUserId(update);
+
+    const messageId =
+      getMessageId(update);
 
     if (
-      chatId === undefined ||
       chatId === null ||
-      userId === undefined ||
-      userId === null
+      chatId === undefined ||
+      userId === null ||
+      userId === undefined
     ) {
       return {
         spoke: false,
-        reason: 'missing identity'
+        reason:
+          'missing identity'
       };
     }
+
+    // ----------------------------------------------------------
+    // CONFIG
+    // ----------------------------------------------------------
 
     const cooldownMs =
       numberEnv(
@@ -718,23 +2338,53 @@ export async function handleGroupParticipation(
         24 * 60 * 60
       );
 
-    const decisionTimeoutMs =
+    const activeWindowMs =
       numberEnv(
         env,
-        'GROUP_AI_DECISION_TIMEOUT_MS',
-        DEFAULT_DECISION_TIMEOUT_MS,
-        5000,
-        30_000
+        'GROUP_AI_ACTIVE_WINDOW_MS',
+        DEFAULT_ACTIVE_WINDOW_MS,
+        30_000,
+        10 * 60 * 1000
       );
 
-    const responseTimeoutMs =
+    const minMessages =
       numberEnv(
         env,
-        'GROUP_AI_RESPONSE_TIMEOUT_MS',
-        DEFAULT_RESPONSE_TIMEOUT_MS,
-        5000,
+        'GROUP_AI_MIN_MESSAGES',
+        DEFAULT_MIN_MESSAGES,
+        2,
+        20
+      );
+
+    const activityThreshold =
+      numberEnv(
+        env,
+        'GROUP_AI_ACTIVITY_THRESHOLD',
+        DEFAULT_ACTIVITY_THRESHOLD,
+        20,
+        100
+      );
+
+    const aiTimeoutMs =
+      numberEnv(
+        env,
+        'GROUP_AI_TIMEOUT_MS',
+        DEFAULT_AI_TIMEOUT_MS,
+        5_000,
         60_000
       );
+
+    // ----------------------------------------------------------
+    // SCHEMA
+    // ----------------------------------------------------------
+
+    await ensureLoreSchema(
+      env
+    );
+
+    // ----------------------------------------------------------
+    // LOAD HISTORY
+    // ----------------------------------------------------------
 
     let history =
       await loadHistory(
@@ -744,10 +2394,19 @@ export async function handleGroupParticipation(
         historyTtl
       );
 
+    const replyContext =
+      getReplyContext(
+        message
+      );
+
+    const replyToStakick =
+      isReplyToStakick(
+        replyContext,
+        botUsername
+      );
+
     const currentItem = {
-      messageId:
-        message.message_id ??
-        null,
+      messageId,
 
       userId:
         String(userId),
@@ -762,76 +2421,279 @@ export async function handleGroupParticipation(
       text,
 
       timestamp:
-        Date.now()
+        Date.now(),
+
+      isBot:
+        false
     };
 
     history = [
       ...history,
       currentItem
-    ].slice(-historyLimit);
+    ].slice(
+      -historyLimit
+    );
 
     await saveHistory(
       env,
       chatId,
       history,
+      historyLimit,
       historyTtl
     );
 
-    const score =
-      scoreConversation(
-        history,
-        text
+    // ----------------------------------------------------------
+    // PRIORITY
+    // ----------------------------------------------------------
+
+    const replyPriority =
+      replyToStakick;
+
+    // ----------------------------------------------------------
+    // WAIT STATE
+    // ----------------------------------------------------------
+
+    const pending =
+      await loadPending(
+        env,
+        chatId
       );
 
-    if (score < 55) {
-      return {
-        spoke: false,
-        reason:
-          `low activity score (${score})`
-      };
+    if (
+      pending
+    ) {
+      const createdAt =
+        Number(
+          pending?.createdAt ||
+          0
+        );
+
+      const waitMs =
+        Math.min(
+          DEFAULT_PENDING_MAX_WAIT_MS,
+          Math.max(
+            DEFAULT_PENDING_MIN_WAIT_MS,
+            Number(
+              pending?.waitMs ||
+              30_000
+            )
+          )
+        );
+
+      /*
+       * A direct reply to Stakick overrides a previous WAIT.
+       * Otherwise allow the conversation to develop for at least
+       * the requested waiting period.
+       */
+      if (
+        !replyPriority &&
+        createdAt &&
+        Date.now() -
+          createdAt <
+          waitMs
+      ) {
+        return {
+          spoke: false,
+          reason:
+            'pending wait window'
+        };
+      }
+
+      await clearPending(
+        env,
+        chatId
+      );
     }
 
+    // ----------------------------------------------------------
+    // ACTIVITY SCORE
+    // ----------------------------------------------------------
+
+    const activityScore =
+      scoreConversation(
+        history,
+        text,
+        activeWindowMs,
+        minMessages,
+        replyPriority
+      );
+
+    /*
+     * A direct reply to Stakick gets a lower local barrier.
+     */
+    const effectiveThreshold =
+      replyPriority
+        ? Math.max(
+            22,
+            activityThreshold -
+              15
+          )
+        : activityThreshold;
+
     if (
-      await cooldownActive(
-        env,
-        chatId,
-        cooldownMs
-      )
+      activityScore <
+      effectiveThreshold
     ) {
       return {
         spoke: false,
-        reason: 'cooldown'
+        reason:
+          `low activity score (${activityScore})`
       };
     }
+
+    // ----------------------------------------------------------
+    // COOLDOWN
+    // ----------------------------------------------------------
+
+    /*
+     * Direct replies can bypass the normal cooldown, but only
+     * if enough time has passed to avoid bot-to-human spam loops.
+     */
+    const lastBotTime =
+      await loadLastBotTime(
+        env,
+        chatId
+      );
+
+    const minimumFollowupGap =
+      25_000;
+
+    if (
+      lastBotTime &&
+      Date.now() -
+        lastBotTime <
+        (replyPriority
+          ? minimumFollowupGap
+          : cooldownMs)
+    ) {
+      return {
+        spoke: false,
+        reason:
+          'cooldown'
+      };
+    }
+
+    // ----------------------------------------------------------
+    // GROUP MEMORY
+    // ----------------------------------------------------------
+
+    const lore =
+      await loadGroupLore(
+        env,
+        chatId,
+        MAX_LORE_ITEMS
+      );
+
+    // ----------------------------------------------------------
+    // GROUP VIBE
+    // ----------------------------------------------------------
+
+    const existingVibe =
+      await loadVibe(
+        env,
+        chatId
+      );
+
+    // ----------------------------------------------------------
+    // TOPIC
+    // ----------------------------------------------------------
+
+    const previousTopic =
+      await loadLastTopic(
+        env,
+        chatId
+      );
+
+    // ----------------------------------------------------------
+    // SENSITIVE TOPIC
+    // ----------------------------------------------------------
+
+    const sensitive =
+      containsSensitiveTopic(
+        [
+          text,
+          ...history
+            .slice(-6)
+            .map(
+              (item) =>
+                item?.text || ''
+            )
+        ].join(' ')
+      );
+
+    // ----------------------------------------------------------
+    // AI PROMPT
+    // ----------------------------------------------------------
+
+    const prompt =
+      buildAutonomousPrompt({
+        history:
+          formatHistory(
+            history
+          ),
+
+        currentText:
+          text,
+
+        currentUsername:
+          currentItem.username,
+
+        replyContext,
+
+        replyToStakick,
+
+        lore,
+
+        previousTopic,
+
+        vibe:
+          existingVibe,
+
+        activityScore,
+
+        sensitive
+      });
 
     const host =
       env.BOT_HOST ||
       'stakick-bot.workers.dev';
 
-    let decisionText = '';
+    // ----------------------------------------------------------
+    // ONE AI CALL
+    // ----------------------------------------------------------
+
+    let aiRaw = '';
 
     try {
-      decisionText =
+      aiRaw =
         await queryAI(
           env,
-          buildDecisionPrompt(
-            history,
-            text
-          ),
+          prompt,
           {
             host,
-            useMemory: false,
-            saveMemory: false,
-            webSearch: false,
-            maxTokens: 180,
-            temperature: 0.1,
+
+            useMemory:
+              false,
+
+            saveMemory:
+              false,
+
+            webSearch:
+              false,
+
+            maxTokens:
+              650,
+
+            temperature:
+              0.78,
+
             timeoutMs:
-              decisionTimeoutMs
+              aiTimeoutMs
           }
         );
     } catch (error) {
       console.error(
-        'Group AI decision failed:',
+        'Autonomous group AI failed:',
         error?.message ||
           error
       );
@@ -839,16 +2701,150 @@ export async function handleGroupParticipation(
       return {
         spoke: false,
         reason:
-          'decision request failed'
+          'AI request failed'
       };
     }
 
     const decision =
       parseDecision(
-        decisionText
+        aiRaw
       );
 
-    if (!decision.shouldSpeak) {
+    // ----------------------------------------------------------
+    // VIBE UPDATE
+    // ----------------------------------------------------------
+
+    if (
+      decision.vibe
+    ) {
+      await saveVibe(
+        env,
+        chatId,
+        decision.vibe
+      );
+    }
+
+    // ----------------------------------------------------------
+    // TOPIC UPDATE
+    // ----------------------------------------------------------
+
+    if (
+      decision.topic
+    ) {
+      await saveLastTopic(
+        env,
+        chatId,
+        decision.topic
+      );
+    }
+
+    // ----------------------------------------------------------
+    // MEMORY UPDATE
+    // ----------------------------------------------------------
+
+    if (
+      decision.memory
+        ?.remember &&
+      decision.memory
+        ?.text &&
+      decision.memory
+        ?.importance >=
+        0.65
+    ) {
+      await saveGroupMemory(
+        env,
+        {
+          chatId,
+
+          userId,
+
+          memory:
+            decision.memory
+              .text,
+
+          category:
+            decision.memory
+              .category,
+
+          importance:
+            decision.memory
+              .importance
+        }
+      );
+    }
+
+    // ----------------------------------------------------------
+    // MARK EXISTING LORE USED
+    // ----------------------------------------------------------
+
+    if (
+      decision.loreIds?.length
+    ) {
+      await markLoreUsed(
+        env,
+        decision.loreIds
+      );
+    }
+
+    // ----------------------------------------------------------
+    // CONFIDENCE GATE
+    // ----------------------------------------------------------
+
+    const minimumConfidence =
+      replyPriority
+        ? 0.55
+        : 0.62;
+
+    if (
+      decision.confidence <
+      minimumConfidence
+    ) {
+      if (
+        decision.action ===
+        'WAIT'
+      ) {
+        const waitMs =
+          Math.min(
+            DEFAULT_PENDING_MAX_WAIT_MS,
+            Math.max(
+              DEFAULT_PENDING_MIN_WAIT_MS,
+              decision.waitSeconds *
+                1000
+            )
+          );
+
+        await savePending(
+          env,
+          chatId,
+          {
+            createdAt:
+              Date.now(),
+
+            waitMs,
+
+            reason:
+              decision.reason ||
+              'low-confidence waiting'
+          },
+          DEFAULT_PENDING_MAX_WAIT_MS
+        );
+      }
+
+      return {
+        spoke: false,
+        reason:
+          'low AI confidence'
+      };
+    }
+
+    // ----------------------------------------------------------
+    // IGNORE
+    // ----------------------------------------------------------
+
+    if (
+      decision.action ===
+      'IGNORE'
+    ) {
       return {
         spoke: false,
         reason:
@@ -857,58 +2853,173 @@ export async function handleGroupParticipation(
       };
     }
 
-    let reply = '';
+    // ----------------------------------------------------------
+    // WAIT
+    // ----------------------------------------------------------
 
-    try {
-      reply =
-        await queryAI(
-          env,
-          buildResponsePrompt(
-            history,
-            text,
-            currentItem.username
-          ),
-          {
-            host,
-            useMemory: false,
-            saveMemory: false,
-            webSearch: false,
-            maxTokens: 350,
-            temperature: 0.85,
-            timeoutMs:
-              responseTimeoutMs
-          }
+    if (
+      decision.action ===
+      'WAIT'
+    ) {
+      const waitMs =
+        Math.min(
+          DEFAULT_PENDING_MAX_WAIT_MS,
+          Math.max(
+            DEFAULT_PENDING_MIN_WAIT_MS,
+            decision.waitSeconds *
+              1000
+          )
         );
-    } catch (error) {
-      console.error(
-        'Group AI response failed:',
-        error?.message ||
-          error
+
+      await savePending(
+        env,
+        chatId,
+        {
+          createdAt:
+            Date.now(),
+
+          waitMs,
+
+          reason:
+            decision.reason ||
+            'conversation still developing'
+        },
+        DEFAULT_PENDING_MAX_WAIT_MS
       );
 
       return {
         spoke: false,
         reason:
-          'response request failed'
+          decision.reason ||
+          'waiting'
       };
     }
 
-    reply =
-      cleanAIReply(reply);
+    // ----------------------------------------------------------
+    // REPLY VALIDATION
+    // ----------------------------------------------------------
+
+    const reply =
+      cleanReply(
+        decision.reply
+      );
 
     if (!reply) {
       return {
         spoke: false,
         reason:
-          'empty response'
+          'REPLY selected without a message'
       };
     }
+
+    // ----------------------------------------------------------
+    // ANTI-REPETITION
+    // ----------------------------------------------------------
+
+    const recentBotMessages =
+      history
+        .filter(
+          (item) =>
+            item?.isBot
+        )
+        .slice(-3);
+
+    const normalizedReply =
+      reply
+        .toLowerCase()
+        .replace(
+          /\s+/g,
+          ' '
+        )
+        .trim();
+
+    const repeated =
+      recentBotMessages.some(
+        (item) => {
+          const previous =
+            cleanMessage(
+              item?.text
+            )
+              .toLowerCase()
+              .replace(
+                /\s+/g,
+                ' '
+              )
+              .trim();
+
+          return (
+            previous ===
+              normalizedReply ||
+            (
+              previous.length >
+                30 &&
+              normalizedReply.length >
+                30 &&
+              (
+                previous.includes(
+                  normalizedReply
+                ) ||
+                normalizedReply.includes(
+                  previous
+                )
+              )
+            )
+          );
+        }
+      );
+
+    if (
+      repeated
+    ) {
+      return {
+        spoke: false,
+        reason:
+          'duplicate response prevented'
+      };
+    }
+
+    // ----------------------------------------------------------
+    // CLEAR WAIT
+    // ----------------------------------------------------------
+
+    await clearPending(
+      env,
+      chatId
+    );
+
+    // ----------------------------------------------------------
+    // NATURAL DELAY
+    // ----------------------------------------------------------
+
+    /*
+     * Direct replies feel faster.
+     * General participation gets a slightly longer delay.
+     */
+    try {
+      await sleep(
+        randomReplyDelayMs(
+          replyPriority
+            ? 90
+            : activityScore
+        )
+      );
+    } catch {
+      // Cosmetic.
+    }
+
+    // ----------------------------------------------------------
+    // COOLDOWN RESERVATION
+    // ----------------------------------------------------------
 
     await setCooldown(
       env,
       chatId,
       cooldownMs
     );
+
+    // ----------------------------------------------------------
+    // TYPING
+    // ----------------------------------------------------------
 
     try {
       if (
@@ -921,30 +3032,118 @@ export async function handleGroupParticipation(
         );
       }
     } catch {
-      // Typing is cosmetic.
+      // Cosmetic.
     }
+
+    // ----------------------------------------------------------
+    // TELEGRAM SEND
+    // ----------------------------------------------------------
 
     const sendOptions = {
       disable_web_page_preview:
         true,
 
       reply_parameters:
-        currentItem.messageId
+        messageId
           ? {
               message_id:
-                currentItem.messageId,
+                messageId,
+
               allow_sending_without_reply:
                 true
             }
           : undefined
     };
 
-    await tg.sendMessage(
-      env.BOT_TOKEN,
-      chatId,
-      reply,
-      sendOptions
+    let sentMessage = null;
+
+    try {
+      sentMessage =
+        await tg.sendMessage(
+          env.BOT_TOKEN,
+          chatId,
+          reply,
+          sendOptions
+        );
+    } catch (error) {
+      console.error(
+        'Autonomous group reply send failed:',
+        error?.message ||
+          error
+      );
+
+      /*
+       * Do not leave a long cooldown behind when Telegram
+       * rejected the actual message.
+       */
+      try {
+        await env.KV.delete(
+          getCooldownKey(
+            chatId
+          )
+        );
+      } catch {
+        // Ignore cleanup failure.
+      }
+
+      return {
+        spoke: false,
+        reason:
+          'Telegram send failed'
+      };
+    }
+
+    // ----------------------------------------------------------
+    // SAVE STAKICK MESSAGE TO CONTEXT
+    // ----------------------------------------------------------
+
+    const botMessageId =
+      sentMessage?.result
+        ?.message_id ??
+      sentMessage?.message_id ??
+      null;
+
+    const updatedHistory = [
+      ...history,
+      {
+        messageId:
+          botMessageId,
+
+        userId:
+          'stakick-bot',
+
+        username:
+          botUsername
+            ? `@${botUsername}`
+            : 'Stakick',
+
+        firstName:
+          'Stakick',
+
+        text:
+          reply,
+
+        timestamp:
+          Date.now(),
+
+        isBot:
+          true
+      }
+    ].slice(
+      -historyLimit
     );
+
+    await saveHistory(
+      env,
+      chatId,
+      updatedHistory,
+      historyLimit,
+      historyTtl
+    );
+
+    // ----------------------------------------------------------
+    // LOG
+    // ----------------------------------------------------------
 
     console.log(
       JSON.stringify({
@@ -954,30 +3153,53 @@ export async function handleGroupParticipation(
         chatId:
           String(chatId),
 
-        messageId:
-          currentItem.messageId,
+        messageId,
 
-        style:
-          decision.style ||
-          'other',
+        botMessageId,
 
-        activityScore:
-          score
+        action:
+          decision.action,
+
+        confidence:
+          decision.confidence,
+
+        activityScore,
+
+        replyPriority,
+
+        replyToStakick,
+
+        sensitive,
+
+        topic:
+          decision.topic ||
+          previousTopic ||
+          null,
+
+        memorySaved:
+          Boolean(
+            decision.memory
+              ?.remember
+          )
       })
     );
 
     return {
-      spoke: true,
+      spoke:
+        true,
+
       reason:
         decision.reason ||
         'AI chose participation',
 
-      style:
-        decision.style ||
-        'other',
+      activityScore,
 
-      activityScore:
-        score
+      confidence:
+        decision.confidence,
+
+      replyToStakick,
+
+      botMessageId
     };
   } catch (error) {
     console.error(
